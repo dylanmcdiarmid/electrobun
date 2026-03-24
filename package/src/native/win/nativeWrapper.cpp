@@ -2763,6 +2763,27 @@ public:
 
 HWND MainThreadDispatcher::g_messageWindow = NULL;
 
+// Get the DPI scale factor for the monitor containing the given window.
+// Returns 1.0 at 100% scaling, 1.25 at 125%, 1.5 at 150%, etc.
+static double getWindowDpiScale(HWND hwnd) {
+    HMONITOR hMonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    typedef HRESULT(WINAPI *GetDpiForMonitorFunc)(HMONITOR, int, UINT*, UINT*);
+    HMODULE shcore = LoadLibraryW(L"Shcore.dll");
+    if (shcore) {
+        auto getDpi = (GetDpiForMonitorFunc)GetProcAddress(shcore, "GetDpiForMonitor");
+        if (getDpi) {
+            UINT dpiX, dpiY;
+            // MDT_EFFECTIVE_DPI = 0
+            if (SUCCEEDED(getDpi(hMonitor, 0, &dpiX, &dpiY))) {
+                FreeLibrary(shcore);
+                return dpiX / 96.0;
+            }
+        }
+        FreeLibrary(shcore);
+    }
+    return 1.0;
+}
+
 // AbstractView base class - Windows implementation matching Mac pattern
 class AbstractView {
 public:
@@ -3714,9 +3735,8 @@ public:
             if (browserHwnd) {
                 int width = frame.right - frame.left;
                 int height = frame.bottom - frame.top;
-                
-                
-                // Move and resize the CEF browser window, bringing it to front
+
+                // CEF handles DPI scaling internally, so pass CSS pixel coordinates directly
                 SetWindowPos(browserHwnd, HWND_TOP, frame.left, frame.top, width, height,
                            SWP_NOACTIVATE | SWP_SHOWWINDOW);
             }
@@ -4007,9 +4027,28 @@ public:
 
     void resize(const RECT& frame, const char* masksJson) override {
         if (hwnd) {
-            int width = frame.right - frame.left;
-            int height = frame.bottom - frame.top;
-            SetWindowPos(hwnd, HWND_TOP, frame.left, frame.top, width, height,
+            HWND parent = GetParent(hwnd);
+            RECT cr; GetClientRect(parent, &cr);
+            double dpiScale = getWindowDpiScale(parent);
+
+            // CSS coordinates are in logical pixels; scale to physical pixels
+            // for per-monitor DPI-aware SetWindowPos
+            int x = (int)(frame.left * dpiScale);
+            int y = (int)(frame.top * dpiScale);
+            int width = (int)((frame.right - frame.left) * dpiScale);
+            int height = (int)((frame.bottom - frame.top) * dpiScale);
+
+            // Clamp to container bounds so we don't overflow
+            if (x + width > cr.right) width = cr.right - x;
+            if (y + height > cr.bottom) height = cr.bottom - y;
+
+            char dbg[512];
+            sprintf_s(dbg, "[WGPU] css=(%ld,%ld,%ld,%ld) phys=(%d,%d,%d,%d) container=(%ld,%ld) dpi=%.2f",
+                frame.left, frame.top, frame.right-frame.left, frame.bottom-frame.top,
+                x, y, width, height, cr.right, cr.bottom, dpiScale);
+            ::log(dbg);
+
+            SetWindowPos(hwnd, HWND_TOP, x, y, width, height,
                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
         visualBounds = frame;
@@ -4392,14 +4431,14 @@ public:
         // Validate that we have a reasonable client area
         int width = clientRect.right - clientRect.left;
         int height = clientRect.bottom - clientRect.top;
-        
+
         if (width <= 0 || height <= 0) {
             char errorMsg[256];
             sprintf_s(errorMsg, "ERROR: Parent window has invalid client area: %dx%d", width, height);
             ::log(errorMsg);
             return;
         }
-        
+
         // Register our custom window class for proper event handling
         static bool classRegistered = false;
         if (!classRegistered) {
@@ -4445,7 +4484,7 @@ public:
             m_hwnd = CreateWindowExA(
                 0,
                 "STATIC",
-                "",  // No title text  
+                "",  // No title text
                 WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
                 0, 0, width, height,
                 parentWindow,
@@ -7198,15 +7237,20 @@ ELECTROBUN_EXPORT AbstractView* initWGPUView(uint32_t webviewId,
             return;
         }
 
+        int sx = (int)x;
+        int sy = (int)y;
+        int sw = (int)width;
+        int sh = (int)height;
+
         view->hwnd = CreateWindowExA(
             0,
             "STATIC",
             "",
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-            (int)x,
-            (int)y,
-            (int)width,
-            (int)height,
+            sx,
+            sy,
+            sw,
+            sh,
             containerHwnd,
             NULL,
             GetModuleHandle(NULL),
