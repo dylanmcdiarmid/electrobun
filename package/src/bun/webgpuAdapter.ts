@@ -113,11 +113,20 @@ const WGPUBufferUsage_Indirect = 0x0000000000000100n;
 const WGPUBufferUsage_QueryResolve = 0x0000000000000200n;
 const WGPUMapMode_Read = 0x0000000000000001n;
 const WGPUMapMode_Write = 0x0000000000000002n;
+const WGPUCallbackMode_AllowProcessEvents = 0x00000002;
 const WGPUCallbackMode_AllowSpontaneous = 0x00000003;
 const WGPUBufferMapState_Mapped = 0x00000003;
 const WGPUMapAsyncStatus_Success = 0x00000001;
 const WGPUQueueWorkDoneStatus_Success = 0x00000001;
 const WGPUColorWriteMask_All = 0x000000000000000F;
+const WGPUErrorFilter_Validation = 0x00000001;
+const WGPUErrorFilter_OutOfMemory = 0x00000002;
+const WGPUErrorFilter_Internal = 0x00000003;
+const WGPUErrorType_NoError = 0x00000001;
+const WGPUErrorType_Validation = 0x00000002;
+const WGPUErrorType_OutOfMemory = 0x00000003;
+const WGPUErrorType_Internal = 0x00000004;
+const WGPUPopErrorScopeStatus_Success = 0x00000001;
 const WGPUBlendOperation_Add = 0x00000001;
 const WGPUBlendFactor_One = 0x00000002;
 const WGPUBlendFactor_Zero = 0x00000001;
@@ -185,6 +194,254 @@ const queueWorkDoneCallback = new JSCallback(
 );
 WGPU_KEEPALIVE.push(queueWorkDoneCallback);
 
+class GPUError {
+	message: string;
+	constructor(message: string) {
+		this.message = message;
+	}
+}
+
+class GPUValidationError extends GPUError {
+	constructor(message: string) {
+		super(message);
+	}
+}
+
+class GPUOutOfMemoryError extends GPUError {
+	constructor(message: string = "") {
+		super(message);
+	}
+}
+
+class GPUInternalError extends GPUError {
+	constructor(message: string = "") {
+		super(message);
+	}
+}
+
+const POP_ERROR_SCOPE_RESOLVERS = new Map<
+	number,
+	(result: { status: number; type: number; message: string }) => void
+>();
+let popErrorScopeCounter = 0;
+
+// popErrorScope callback — fires when an error scope is popped.
+// Uses AllowProcessEvents + threadsafe:false so the callback fires synchronously
+// during wgpuInstanceProcessEvents on the main thread (pointer data is still alive).
+const popErrorScopeCallback = new JSCallback(
+	(
+		status: number,
+		errorType: number,
+		_msgPtr: number,
+		userdata1: number,
+		_userdata2: number,
+	) => {
+		const key = Number(userdata1);
+		const resolve = POP_ERROR_SCOPE_RESOLVERS.get(key);
+		if (resolve) {
+			POP_ERROR_SCOPE_RESOLVERS.delete(key);
+			let message = "";
+			if (_msgPtr) {
+				try {
+					const svBuf = toArrayBuffer(_msgPtr as any, 0, 16);
+					const svView = new DataView(svBuf);
+					const dataPtr = Number(svView.getBigUint64(0, true));
+					const length = Number(svView.getBigUint64(8, true));
+					if (dataPtr && length > 0 && length < 0xffffffff) {
+						const strBuf = toArrayBuffer(dataPtr as any, 0, length);
+						message = new TextDecoder().decode(strBuf);
+					}
+				} catch {}
+			}
+			resolve({ status, type: errorType, message });
+		}
+	},
+	{
+		args: ["u32", "u32", "ptr", "ptr", "ptr"],
+		returns: "void",
+		threadsafe: false,
+	},
+);
+WGPU_KEEPALIVE.push(popErrorScopeCallback);
+
+// Uncaptured error callback — fires GPUDevice._fireUncapturedError.
+// On Windows x64: (device*, WGPUErrorType, hidden_ptr_to_WGPUStringView, userdata1, userdata2)
+// userdata1 = GPUDevice ptr (used to look up the JS device object)
+const DEVICE_REGISTRY = new Map<number, GPUDevice>();
+
+const uncapturedErrorCallback = new JSCallback(
+	(
+		_devicePtr: number,
+		errorType: number,
+		_msgPtr: number,
+		userdata1: number,
+		_userdata2: number,
+	) => {
+		const device = DEVICE_REGISTRY.get(Number(userdata1));
+		if (!device) return;
+		let message = "";
+		if (_msgPtr) {
+			try {
+				const svBuf = toArrayBuffer(_msgPtr as any, 0, 16);
+				const svView = new DataView(svBuf);
+				const dataPtr = Number(svView.getBigUint64(0, true));
+				const length = Number(svView.getBigUint64(8, true));
+				if (dataPtr && length > 0 && length < 0xffffffff) {
+					const strBuf = toArrayBuffer(dataPtr as any, 0, length);
+					message = new TextDecoder().decode(strBuf);
+				}
+			} catch {}
+		}
+		let error: GPUError;
+		if (errorType === WGPUErrorType_Validation) {
+			error = new GPUValidationError(message);
+		} else if (errorType === WGPUErrorType_OutOfMemory) {
+			error = new GPUOutOfMemoryError(message);
+		} else if (errorType === WGPUErrorType_Internal) {
+			error = new GPUInternalError(message);
+		} else {
+			error = new GPUInternalError(message || "unknown error");
+		}
+		device._fireUncapturedError(error);
+	},
+	{
+		args: ["ptr", "u32", "ptr", "ptr", "ptr"],
+		returns: "void",
+		threadsafe: false,
+	},
+);
+WGPU_KEEPALIVE.push(uncapturedErrorCallback);
+
+// Compilation info callback
+interface CompilationMessage {
+	message: string;
+	type: "error" | "warning" | "info";
+	lineNum: number;
+	linePos: number;
+	offset: number;
+	length: number;
+}
+
+const WGPUCompilationMessageType_Error = 0x00000001;
+const WGPUCompilationMessageType_Warning = 0x00000002;
+
+const COMPILATION_INFO_RESOLVERS = new Map<
+	number,
+	(messages: CompilationMessage[]) => void
+>();
+let compilationInfoCounter = 0;
+
+function readStringView(svPtr: number, offset: number): string {
+	try {
+		const svBuf = toArrayBuffer(svPtr as any, offset, 16);
+		const svView = new DataView(svBuf);
+		const dataPtr = Number(svView.getBigUint64(0, true));
+		const length = Number(svView.getBigUint64(8, true));
+		if (dataPtr && length > 0 && length < 0xffffffff) {
+			const strBuf = toArrayBuffer(dataPtr as any, 0, length);
+			return new TextDecoder().decode(strBuf);
+		}
+	} catch {}
+	return "";
+}
+
+const compilationInfoCallback = new JSCallback(
+	(
+		_status: number,
+		compilationInfoPtr: number,
+		userdata1: number,
+		_userdata2: number,
+	) => {
+		const key = Number(userdata1);
+		const resolve = COMPILATION_INFO_RESOLVERS.get(key);
+		if (!resolve) return;
+		COMPILATION_INFO_RESOLVERS.delete(key);
+
+		const messages: CompilationMessage[] = [];
+		if (compilationInfoPtr) {
+			try {
+				// WGPUCompilationInfo: { nextInChain(8), messageCount(8), messages(8) }
+				const infoBuf = toArrayBuffer(compilationInfoPtr as any, 0, 24);
+				const infoView = new DataView(infoBuf);
+				const messageCount = Number(infoView.getBigUint64(8, true));
+				const messagesPtr = Number(infoView.getBigUint64(16, true));
+
+				if (messagesPtr && messageCount > 0 && messageCount < 1000) {
+					// Each WGPUCompilationMessage is 88 bytes
+					const msgArrayBuf = toArrayBuffer(
+						messagesPtr as any,
+						0,
+						messageCount * 88,
+					);
+					const msgArrayView = new DataView(msgArrayBuf);
+
+					for (let i = 0; i < messageCount; i++) {
+						const base = i * 88;
+						// message WGPUStringView at offset 8 (relative to struct start)
+						const msgDataPtr = Number(
+							msgArrayView.getBigUint64(base + 8, true),
+						);
+						const msgLength = Number(
+							msgArrayView.getBigUint64(base + 16, true),
+						);
+						let msgText = "";
+						if (
+							msgDataPtr &&
+							msgLength > 0 &&
+							msgLength < 0xffffffff
+						) {
+							try {
+								const strBuf = toArrayBuffer(
+									msgDataPtr as any,
+									0,
+									msgLength,
+								);
+								msgText = new TextDecoder().decode(strBuf);
+							} catch {}
+						}
+
+						const typeEnum = msgArrayView.getUint32(base + 24, true);
+						const type =
+							typeEnum === WGPUCompilationMessageType_Error
+								? "error"
+								: typeEnum === WGPUCompilationMessageType_Warning
+									? "warning"
+									: "info";
+						const lineNum = Number(
+							msgArrayView.getBigUint64(base + 32, true),
+						);
+						const linePos = Number(
+							msgArrayView.getBigUint64(base + 40, true),
+						);
+						const offset = Number(
+							msgArrayView.getBigUint64(base + 48, true),
+						);
+						const length = Number(
+							msgArrayView.getBigUint64(base + 56, true),
+						);
+
+						messages.push({
+							message: msgText,
+							type,
+							lineNum,
+							linePos,
+							offset,
+							length,
+						});
+					}
+				}
+			} catch {}
+		}
+		resolve(messages);
+	},
+	{
+		args: ["u32", "ptr", "ptr", "ptr"],
+		returns: "void",
+		threadsafe: false,
+	},
+);
+WGPU_KEEPALIVE.push(compilationInfoCallback);
+
 function toBigInt(value: unknown, fallback = 0n) {
 	if (typeof value === "bigint") return value;
 	if (typeof value === "number" && Number.isFinite(value)) {
@@ -226,6 +483,17 @@ function makeStringView(str?: string | null) {
 	const cstr = new CString(str);
 	WGPU_KEEPALIVE.push(cstr);
 	return { ptr: cstr.ptr, len: WGPU_STRLEN, cstr };
+}
+
+// Create a 16-byte WGPUStringView struct { char* data, size_t length } and return pointer
+function makeStringViewStruct(str: string): { buffer: ArrayBuffer; ptr: number } {
+	const sv = makeStringView(str);
+	const buffer = new ArrayBuffer(16);
+	const view = new DataView(buffer);
+	writePtr(view, 0, sv.ptr as any);
+	writeU64(view, 8, sv.len);
+	WGPU_KEEPALIVE.push(buffer);
+	return { buffer, ptr: ptr(buffer) as any };
 }
 
 function makeSurfaceConfiguration(
@@ -580,13 +848,13 @@ function makeComputePipelineDescriptor(
 	return { buffer, ptr: ptr(buffer) };
 }
 
-function makeComputePassDescriptor() {
+function makeComputePassDescriptor(timestampWritesPtr?: number | null) {
 	const buffer = new ArrayBuffer(32);
 	const view = new DataView(buffer);
 	writePtr(view, 0, 0);
 	writePtr(view, 8, 0);
 	writeU64(view, 16, 0n);
-	writePtr(view, 24, 0);
+	writePtr(view, 24, timestampWritesPtr ?? 0);
 	return { buffer, ptr: ptr(buffer) };
 }
 
@@ -599,6 +867,27 @@ function makeBufferMapCallbackInfo(
 	const view = new DataView(buffer);
 	writePtr(view, 0, 0);
 	writeU32(view, 8, WGPUCallbackMode_AllowSpontaneous);
+	writeU32(view, 12, 0);
+	writePtr(view, 16, callbackPtr);
+	writePtr(view, 24, userdata1);
+	writePtr(view, 32, userdata2);
+	return { buffer, ptr: ptr(buffer) };
+}
+
+// Like makeBufferMapCallbackInfo but uses AllowProcessEvents mode so the callback
+// fires synchronously during wgpuInstanceProcessEvents on the main thread.
+// This is needed for callbacks that must dereference pointer arguments (like
+// WGPUStringView) — with AllowSpontaneous + threadsafe:true, the pointed-to data
+// may be freed before the JS callback runs.
+function makeProcessEventsCallbackInfo(
+	callbackPtr: number,
+	userdata1: number,
+	userdata2: number,
+) {
+	const buffer = new ArrayBuffer(40);
+	const view = new DataView(buffer);
+	writePtr(view, 0, 0);
+	writeU32(view, 8, WGPUCallbackMode_AllowProcessEvents);
 	writeU32(view, 12, 0);
 	writePtr(view, 16, callbackPtr);
 	writePtr(view, 24, userdata1);
@@ -791,6 +1080,7 @@ function makeRenderPassDescriptor(
 	colorAttachmentsPtr: number,
 	colorAttachmentCount: number,
 	depthStencilPtr: number | null,
+	timestampWritesPtr?: number | null,
 ) {
 	const buffer = new ArrayBuffer(64);
 	const view = new DataView(buffer);
@@ -801,7 +1091,7 @@ function makeRenderPassDescriptor(
 	writePtr(view, 32, colorAttachmentsPtr);
 	writePtr(view, 40, depthStencilPtr ?? 0);
 	writePtr(view, 48, 0);
-	writePtr(view, 56, 0);
+	writePtr(view, 56, timestampWritesPtr ?? 0);
 	return { buffer, ptr: ptr(buffer) };
 }
 
@@ -868,6 +1158,9 @@ function pickSurfaceFormatAlpha(capsView: DataView, preferredFormat: number) {
 class GPUTexture {
 	ptr: number;
 	format?: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuTextureSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number, format?: number) {
 		this.ptr = ptr;
 		this.format = format;
@@ -919,6 +1212,9 @@ class GPUTexture {
 class GPUTextureView {
 	ptr: number;
 	format?: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuTextureViewSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number, format?: number) {
 		this.ptr = ptr;
 		this.format = format;
@@ -928,6 +1224,9 @@ class GPUTextureView {
 class GPUQueue {
 	ptr: number;
 	_device?: GPUDevice;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuQueueSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -1099,6 +1398,15 @@ class GPUQueue {
 	}
 }
 
+class GPUDeviceLostInfo {
+	reason: "unknown" | "destroyed";
+	message: string;
+	constructor(reason: "unknown" | "destroyed", message: string) {
+		this.reason = reason;
+		this.message = message;
+	}
+}
+
 class GPUDevice {
 	ptr: number;
 	queue: GPUQueue;
@@ -1106,6 +1414,17 @@ class GPUDevice {
 	limits: Record<string, number> = {};
 	_uncapturedErrorListeners: ((event: { error: Error }) => void)[] = [];
 	instancePtr: number | null = null;
+	private _lostPromise: Promise<GPUDeviceLostInfo>;
+	private _lostResolve: ((info: GPUDeviceLostInfo) => void) | null = null;
+	private _label: string = "";
+	get label(): string {
+		return this._label;
+	}
+	set label(value: string) {
+		this._label = value;
+		const sv = makeStringViewStruct(value);
+		WGPUNative.symbols.wgpuDeviceSetLabel(this.ptr, sv.ptr as any);
+	}
 	constructor(ptr: number, instancePtr?: number) {
 		if (!ptr) {
 			throw new Error("Failed to create WGPU device");
@@ -1114,8 +1433,23 @@ class GPUDevice {
 		this.instancePtr = instancePtr ?? null;
 		this.queue = new GPUQueue(WGPUNative.symbols.wgpuDeviceGetQueue(ptr));
 		this.queue._device = this;
+		DEVICE_REGISTRY.set(ptr, this);
+		this._lostPromise = new Promise<GPUDeviceLostInfo>((resolve) => {
+			this._lostResolve = resolve;
+		});
+	}
+	get lost(): Promise<GPUDeviceLostInfo> {
+		return this._lostPromise;
+	}
+	_resolveDeviceLost(reason: "unknown" | "destroyed", message: string) {
+		if (this._lostResolve) {
+			this._lostResolve(new GPUDeviceLostInfo(reason, message));
+			this._lostResolve = null;
+		}
 	}
 	destroy() {
+		DEVICE_REGISTRY.delete(this.ptr);
+		this._resolveDeviceLost("destroyed", "Device was destroyed");
 		if (!this.ptr) return;
 		try {
 			WGPUNative.symbols.wgpuDeviceDestroy(this.ptr);
@@ -1374,7 +1708,7 @@ class GPUDevice {
 			this.ptr,
 			desc.ptr as any,
 		);
-		return new GPUShaderModule(modulePtr);
+		return new GPUShaderModule(modulePtr, this);
 	}
 	createRenderPipeline(descriptor: any) {
 		const vertexModule = descriptor.vertex.module as GPUShaderModule;
@@ -1555,15 +1889,113 @@ class GPUDevice {
 		);
 		return new GPUCommandEncoder(encoderPtr, this);
 	}
+	createQuerySet(descriptor: { type: "timestamp" | "occlusion"; count: number }) {
+		const WGPUQueryType_Occlusion = 0x00000001;
+		const WGPUQueryType_Timestamp = 0x00000002;
+		const typeEnum =
+			descriptor.type === "timestamp"
+				? WGPUQueryType_Timestamp
+				: WGPUQueryType_Occlusion;
+		// WGPUQuerySetDescriptor: nextInChain(8) + label{data(8)+len(8)} + type(4) + count(4) = 32
+		const buf = new ArrayBuffer(32);
+		const view = new DataView(buf);
+		writePtr(view, 0, null); // nextInChain
+		writePtr(view, 8, null); // label.data (empty)
+		writeU64(view, 16, 0); // label.length
+		writeU32(view, 24, typeEnum);
+		writeU32(view, 28, descriptor.count);
+		WGPU_KEEPALIVE.push(buf);
+		const qsPtr = WGPUNative.symbols.wgpuDeviceCreateQuerySet(
+			this.ptr,
+			ptr(buf) as any,
+		);
+		return new GPUQuerySet(qsPtr, descriptor.type, descriptor.count);
+	}
 	addEventListener(type: string, handler: (event: any) => void) {
 		if (type !== "uncapturederror") return;
 		this._uncapturedErrorListeners.push(handler);
 	}
-	pushErrorScope(_filter: any) {
-		return;
+	removeEventListener(type: string, handler: (event: any) => void) {
+		if (type !== "uncapturederror") return;
+		const idx = this._uncapturedErrorListeners.indexOf(handler);
+		if (idx >= 0) this._uncapturedErrorListeners.splice(idx, 1);
 	}
-	popErrorScope() {
-		return Promise.resolve(null);
+	_fireUncapturedError(error: GPUError) {
+		const event = { error, type: "uncapturederror" };
+		for (const listener of this._uncapturedErrorListeners) {
+			try {
+				listener(event);
+			} catch {}
+		}
+	}
+	pushErrorScope(filter: "validation" | "out-of-memory" | "internal") {
+		const filterMap: Record<string, number> = {
+			validation: WGPUErrorFilter_Validation,
+			"out-of-memory": WGPUErrorFilter_OutOfMemory,
+			internal: WGPUErrorFilter_Internal,
+		};
+		const filterEnum = filterMap[filter];
+		if (filterEnum === undefined) return;
+		WGPUNative.symbols.wgpuDevicePushErrorScope(this.ptr, filterEnum);
+	}
+	popErrorScope(): Promise<GPUError | null> {
+		const key = ++popErrorScopeCounter;
+		const callbackPtr =
+			(popErrorScopeCallback as any).ptr ?? popErrorScopeCallback;
+		const info = makeProcessEventsCallbackInfo(Number(callbackPtr), key, 0);
+		WGPU_KEEPALIVE.push(info.buffer);
+
+		return new Promise<GPUError | null>((resolve) => {
+			let done = false;
+			const resolveOnce = (result: GPUError | null) => {
+				if (done) return;
+				done = true;
+				resolve(result);
+			};
+
+			POP_ERROR_SCOPE_RESOLVERS.set(key, ({ status, type, message }) => {
+				if (status !== WGPUPopErrorScopeStatus_Success) {
+					resolveOnce(null);
+					return;
+				}
+				if (type === WGPUErrorType_NoError) {
+					resolveOnce(null);
+				} else if (type === WGPUErrorType_Validation) {
+					resolveOnce(new GPUValidationError(message));
+				} else if (type === WGPUErrorType_OutOfMemory) {
+					resolveOnce(new GPUOutOfMemoryError(message));
+				} else if (type === WGPUErrorType_Internal) {
+					resolveOnce(new GPUInternalError(message));
+				} else {
+					resolveOnce(new GPUInternalError(message || "unknown error"));
+				}
+			});
+
+			WGPUNative.symbols.wgpuDevicePopErrorScope(
+				this.ptr,
+				info.ptr as any,
+			);
+
+			const start = Date.now();
+			const poll = () => {
+				if (done) return;
+				try {
+					if (this.instancePtr) {
+						WGPUNative.symbols.wgpuInstanceProcessEvents(
+							this.instancePtr,
+						);
+					}
+					WGPUNative.symbols.wgpuDeviceTick(this.ptr);
+				} catch {}
+				if (Date.now() - start > 2000) {
+					POP_ERROR_SCOPE_RESOLVERS.delete(key);
+					resolveOnce(null);
+					return;
+				}
+				if (!done) setTimeout(poll, 5);
+			};
+			setTimeout(poll, 5);
+		});
 	}
 }
 
@@ -1573,6 +2005,15 @@ class GPUBuffer {
 	usage: bigint;
 	_device: GPUDevice;
 	_mapped: boolean;
+	private _label: string = "";
+	get label(): string {
+		return this._label;
+	}
+	set label(value: string) {
+		this._label = value;
+		const sv = makeStringViewStruct(value);
+		WGPUNative.symbols.wgpuBufferSetLabel(this.ptr, sv.ptr as any);
+	}
 	constructor(ptr: number, size: number, usage: bigint, device: GPUDevice, mapped = false) {
 		this.ptr = ptr;
 		this.size = size;
@@ -1585,11 +2026,14 @@ class GPUBuffer {
 			return new ArrayBuffer(0);
 		}
 		const size = Math.max(0, _size ?? this.size - _offset);
-		const mapped = WGPUNative.symbols.wgpuBufferGetMappedRange(
-			this.ptr,
-			BigInt(_offset),
-			BigInt(size),
-		);
+		// Use the const version for MAP_READ buffers, non-const for MAP_WRITE.
+		// Dawn returns null from wgpuBufferGetMappedRange for read-only mappings.
+		const isReadMap = (this.usage & WGPUBufferUsage_MapRead) !== 0n;
+		const mapped = isReadMap
+			? WGPUNative.symbols.wgpuBufferGetConstMappedRange(
+				this.ptr, BigInt(_offset), BigInt(size))
+			: WGPUNative.symbols.wgpuBufferGetMappedRange(
+				this.ptr, BigInt(_offset), BigInt(size));
 		if (!mapped) {
 			return new ArrayBuffer(0);
 		}
@@ -1728,6 +2172,9 @@ class GPUBuffer {
 
 class GPUSampler {
 	ptr: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuSamplerSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -1735,6 +2182,9 @@ class GPUSampler {
 
 class GPUBindGroupLayout {
 	ptr: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuBindGroupLayoutSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -1742,6 +2192,9 @@ class GPUBindGroupLayout {
 
 class GPUBindGroup {
 	ptr: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuBindGroupSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -1749,6 +2202,9 @@ class GPUBindGroup {
 
 class GPUPipelineLayout {
 	ptr: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuPipelineLayoutSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -1756,13 +2212,69 @@ class GPUPipelineLayout {
 
 class GPUShaderModule {
 	ptr: number;
-	constructor(ptr: number) {
+	_device: GPUDevice | null = null;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuShaderModuleSetLabel(this.ptr, sv.ptr as any); }
+	constructor(ptr: number, device?: GPUDevice) {
 		this.ptr = ptr;
+		this._device = device ?? null;
+	}
+	getCompilationInfo(): Promise<{ messages: CompilationMessage[] }> {
+		const key = ++compilationInfoCounter;
+		const callbackPtr =
+			(compilationInfoCallback as any).ptr ?? compilationInfoCallback;
+		const info = makeProcessEventsCallbackInfo(Number(callbackPtr), key, 0);
+		WGPU_KEEPALIVE.push(info.buffer);
+
+		return new Promise<{ messages: CompilationMessage[] }>((resolve) => {
+			let done = false;
+			const resolveOnce = (messages: CompilationMessage[]) => {
+				if (done) return;
+				done = true;
+				resolve({ messages });
+			};
+
+			COMPILATION_INFO_RESOLVERS.set(key, (messages) => {
+				resolveOnce(messages);
+			});
+
+			WGPUNative.symbols.wgpuShaderModuleGetCompilationInfo(
+				this.ptr,
+				info.ptr as any,
+			);
+
+			const device = this._device;
+			const start = Date.now();
+			const poll = () => {
+				if (done) return;
+				try {
+					if (device?.instancePtr) {
+						WGPUNative.symbols.wgpuInstanceProcessEvents(
+							device.instancePtr,
+						);
+					}
+					if (device) {
+						WGPUNative.symbols.wgpuDeviceTick(device.ptr);
+					}
+				} catch {}
+				if (Date.now() - start > 2000) {
+					COMPILATION_INFO_RESOLVERS.delete(key);
+					resolveOnce([]);
+					return;
+				}
+				if (!done) setTimeout(poll, 5);
+			};
+			setTimeout(poll, 5);
+		});
 	}
 }
 
 class GPURenderPipeline {
 	ptr: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuRenderPipelineSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -1777,6 +2289,9 @@ class GPURenderPipeline {
 
 class GPUComputePipeline {
 	ptr: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuComputePipelineSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -1789,8 +2304,28 @@ class GPUComputePipeline {
 	}
 }
 
+class GPUQuerySet {
+	ptr: number;
+	type: "timestamp" | "occlusion";
+	count: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuQuerySetSetLabel(this.ptr, sv.ptr as any); }
+	constructor(ptr: number, type: "timestamp" | "occlusion", count: number) {
+		this.ptr = ptr;
+		this.type = type;
+		this.count = count;
+	}
+	destroy() {
+		WGPUNative.symbols.wgpuQuerySetDestroy(this.ptr);
+	}
+}
+
 class GPUCommandBuffer {
 	ptr: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuCommandBufferSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -1799,6 +2334,9 @@ class GPUCommandBuffer {
 class GPUCommandEncoder {
 	ptr: number;
 	_device: GPUDevice;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuCommandEncoderSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number, device: GPUDevice) {
 		this.ptr = ptr;
 		this._device = device;
@@ -1821,6 +2359,11 @@ class GPUCommandEncoder {
 			stencilLoadOp?: string;
 			stencilStoreOp?: string;
 			stencilReadOnly?: boolean;
+		};
+		timestampWrites?: {
+			querySet: GPUQuerySet;
+			beginningOfPassWriteIndex?: number;
+			endOfPassWriteIndex?: number;
 		};
 	}) {
 		const colorAttachments = descriptor.colorAttachments.map((c) =>
@@ -1862,10 +2405,24 @@ class GPUCommandEncoder {
 			}
 		}
 
+		let tsWritesPtr: number | null = null;
+		if (descriptor.timestampWrites) {
+			const tw = descriptor.timestampWrites;
+			// WGPURenderPassTimestampWrites: querySet(8) + beginIndex(4) + endIndex(4) = 16
+			const twBuf = new ArrayBuffer(16);
+			const twView = new DataView(twBuf);
+			writePtr(twView, 0, tw.querySet.ptr);
+			writeU32(twView, 8, tw.beginningOfPassWriteIndex ?? 0xffffffff);
+			writeU32(twView, 12, tw.endOfPassWriteIndex ?? 0xffffffff);
+			WGPU_KEEPALIVE.push(twBuf);
+			tsWritesPtr = ptr(twBuf) as any;
+		}
+
 		const passDesc = makeRenderPassDescriptor(
 			colorPtr as any,
 			colorAttachments.length,
 			depthPtr,
+			tsWritesPtr,
 		);
 		WGPU_KEEPALIVE.push(passDesc.buffer);
 		const passPtr = WGPUNative.symbols.wgpuCommandEncoderBeginRenderPass(
@@ -1874,8 +2431,25 @@ class GPUCommandEncoder {
 		);
 		return new GPURenderPassEncoder(passPtr);
 	}
-	beginComputePass() {
-		const desc = makeComputePassDescriptor();
+	beginComputePass(descriptor?: {
+		timestampWrites?: {
+			querySet: GPUQuerySet;
+			beginningOfPassWriteIndex?: number;
+			endOfPassWriteIndex?: number;
+		};
+	}) {
+		let tsWritesPtr: number | null = null;
+		if (descriptor?.timestampWrites) {
+			const tw = descriptor.timestampWrites;
+			const twBuf = new ArrayBuffer(16);
+			const twView = new DataView(twBuf);
+			writePtr(twView, 0, tw.querySet.ptr);
+			writeU32(twView, 8, tw.beginningOfPassWriteIndex ?? 0xffffffff);
+			writeU32(twView, 12, tw.endOfPassWriteIndex ?? 0xffffffff);
+			WGPU_KEEPALIVE.push(twBuf);
+			tsWritesPtr = ptr(twBuf) as any;
+		}
+		const desc = makeComputePassDescriptor(tsWritesPtr);
 		WGPU_KEEPALIVE.push(desc.buffer);
 		const passPtr = WGPUNative.symbols.wgpuCommandEncoderBeginComputePass(
 			this.ptr,
@@ -1913,6 +2487,112 @@ class GPUCommandEncoder {
 			size,
 		);
 	}
+	pushDebugGroup(groupLabel: string) {
+		const sv = makeStringViewStruct(groupLabel);
+		WGPUNative.symbols.wgpuCommandEncoderPushDebugGroup(this.ptr, sv.ptr as any);
+	}
+	popDebugGroup() {
+		WGPUNative.symbols.wgpuCommandEncoderPopDebugGroup(this.ptr);
+	}
+	insertDebugMarker(markerLabel: string) {
+		const sv = makeStringViewStruct(markerLabel);
+		WGPUNative.symbols.wgpuCommandEncoderInsertDebugMarker(this.ptr, sv.ptr as any);
+	}
+	writeTimestamp(querySet: GPUQuerySet, queryIndex: number) {
+		WGPUNative.symbols.wgpuCommandEncoderWriteTimestamp(
+			this.ptr,
+			querySet.ptr,
+			queryIndex,
+		);
+	}
+	resolveQuerySet(
+		querySet: GPUQuerySet,
+		firstQuery: number,
+		queryCount: number,
+		destination: GPUBuffer,
+		destinationOffset: number,
+	) {
+		WGPUNative.symbols.wgpuCommandEncoderResolveQuerySet(
+			this.ptr,
+			querySet.ptr,
+			firstQuery,
+			queryCount,
+			destination.ptr,
+			BigInt(destinationOffset),
+		);
+	}
+	copyTextureToBuffer(
+		source: {
+			texture: GPUTexture;
+			mipLevel?: number;
+			origin?: { x?: number; y?: number; z?: number } | [number, number, number];
+		},
+		destination: {
+			buffer: GPUBuffer;
+			offset?: number;
+			bytesPerRow: number;
+			rowsPerImage?: number;
+		},
+		copySize: { width: number; height?: number; depthOrArrayLayers?: number } | [number, number?, number?],
+	) {
+		// Parse origin
+		let ox = 0, oy = 0, oz = 0;
+		if (Array.isArray(source.origin)) {
+			[ox, oy, oz] = [source.origin[0] ?? 0, source.origin[1] ?? 0, source.origin[2] ?? 0];
+		} else if (source.origin) {
+			ox = source.origin.x ?? 0;
+			oy = source.origin.y ?? 0;
+			oz = source.origin.z ?? 0;
+		}
+
+		// Parse copySize
+		let width = 0, height = 1, depth = 1;
+		if (Array.isArray(copySize)) {
+			[width, height, depth] = [copySize[0] ?? 0, copySize[1] ?? 1, copySize[2] ?? 1];
+		} else {
+			width = copySize.width;
+			height = copySize.height ?? 1;
+			depth = copySize.depthOrArrayLayers ?? 1;
+		}
+
+		// WGPUImageCopyTexture: nextInChain(8) + texture(8) + mipLevel(4) + origin{x,y,z}(12) + aspect(4) + pad(4) = 40
+		const srcBuf = new ArrayBuffer(40);
+		const srcView = new DataView(srcBuf);
+		writePtr(srcView, 0, null);
+		writePtr(srcView, 8, source.texture.ptr);
+		writeU32(srcView, 16, source.mipLevel ?? 0);
+		writeU32(srcView, 20, ox);
+		writeU32(srcView, 24, oy);
+		writeU32(srcView, 28, oz);
+		writeU32(srcView, 32, 0); // WGPUTextureAspect_All = 0
+		WGPU_KEEPALIVE.push(srcBuf);
+
+		// WGPUImageCopyBuffer: nextInChain(8) + layout{nextInChain(8)+offset(8)+bytesPerRow(4)+rowsPerImage(4)} + buffer(8) = 40
+		const dstBuf = new ArrayBuffer(40);
+		const dstView = new DataView(dstBuf);
+		writePtr(dstView, 0, null);
+		writePtr(dstView, 8, null); // layout.nextInChain
+		writeU64(dstView, 16, destination.offset ?? 0);
+		writeU32(dstView, 24, destination.bytesPerRow);
+		writeU32(dstView, 28, destination.rowsPerImage ?? 0);
+		writePtr(dstView, 32, destination.buffer.ptr);
+		WGPU_KEEPALIVE.push(dstBuf);
+
+		// WGPUExtent3D: width(4) + height(4) + depthOrArrayLayers(4) = 12
+		const sizeBuf = new ArrayBuffer(12);
+		const sizeView = new DataView(sizeBuf);
+		writeU32(sizeView, 0, width);
+		writeU32(sizeView, 4, height);
+		writeU32(sizeView, 8, depth);
+		WGPU_KEEPALIVE.push(sizeBuf);
+
+		WGPUNative.symbols.wgpuCommandEncoderCopyTextureToBuffer(
+			this.ptr,
+			ptr(srcBuf) as any,
+			ptr(dstBuf) as any,
+			ptr(sizeBuf) as any,
+		);
+	}
 	copyBufferToBuffer(
 		source: GPUBuffer,
 		sourceOffset: number,
@@ -1937,6 +2617,9 @@ class GPUCommandEncoder {
 
 class GPURenderPassEncoder {
 	ptr: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuRenderPassEncoderSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -2024,6 +2707,17 @@ class GPURenderPassEncoder {
 			firstInstance,
 		);
 	}
+	pushDebugGroup(groupLabel: string) {
+		const sv = makeStringViewStruct(groupLabel);
+		WGPUNative.symbols.wgpuRenderPassEncoderPushDebugGroup(this.ptr, sv.ptr as any);
+	}
+	popDebugGroup() {
+		WGPUNative.symbols.wgpuRenderPassEncoderPopDebugGroup(this.ptr);
+	}
+	insertDebugMarker(markerLabel: string) {
+		const sv = makeStringViewStruct(markerLabel);
+		WGPUNative.symbols.wgpuRenderPassEncoderInsertDebugMarker(this.ptr, sv.ptr as any);
+	}
 	end() {
 		WGPUNative.symbols.wgpuRenderPassEncoderEnd(this.ptr);
 	}
@@ -2031,6 +2725,9 @@ class GPURenderPassEncoder {
 
 class GPUComputePassEncoder {
 	ptr: number;
+	private _label: string = "";
+	get label(): string { return this._label; }
+	set label(value: string) { this._label = value; const sv = makeStringViewStruct(value); WGPUNative.symbols.wgpuComputePassEncoderSetLabel(this.ptr, sv.ptr as any); }
 	constructor(ptr: number) {
 		this.ptr = ptr;
 	}
@@ -2068,14 +2765,85 @@ class GPUComputePassEncoder {
 			z,
 		);
 	}
+	pushDebugGroup(groupLabel: string) {
+		const sv = makeStringViewStruct(groupLabel);
+		WGPUNative.symbols.wgpuComputePassEncoderPushDebugGroup(this.ptr, sv.ptr as any);
+	}
+	popDebugGroup() {
+		WGPUNative.symbols.wgpuComputePassEncoderPopDebugGroup(this.ptr);
+	}
+	insertDebugMarker(markerLabel: string) {
+		const sv = makeStringViewStruct(markerLabel);
+		WGPUNative.symbols.wgpuComputePassEncoderInsertDebugMarker(this.ptr, sv.ptr as any);
+	}
 	end() {
 		WGPUNative.symbols.wgpuComputePassEncoderEnd(this.ptr);
 	}
 }
 
+// WGPUFeatureName enum → WebGPU feature string mapping
+const WGPU_FEATURE_MAP: [number, string][] = [
+	[0x00000001, "depth-clip-control"],
+	[0x00000002, "depth32float-stencil8"],
+	[0x00000003, "timestamp-query"],
+	[0x00000004, "texture-compression-bc"],
+	[0x00000005, "texture-compression-bc-sliced-3d"],
+	[0x00000006, "texture-compression-etc2"],
+	[0x00000007, "texture-compression-astc"],
+	[0x00000008, "texture-compression-astc-sliced-3d"],
+	[0x00000009, "indirect-first-instance"],
+	[0x0000000a, "shader-f16"],
+	[0x0000000b, "rg11b10ufloat-renderable"],
+	[0x0000000c, "bgra8unorm-storage"],
+	[0x0000000d, "float32-filterable"],
+	[0x0000000e, "float32-blendable"],
+	[0x0000000f, "subgroups"],
+	[0x00000010, "subgroups-f16"],
+	[0x00000011, "dual-source-blending"],
+	[0x00000012, "clip-distances"],
+];
+
+// WGPULimits field layout: offset from start of WGPULimits struct, name, type
+const WGPU_LIMITS_LAYOUT: [number, string, "u32" | "u64"][] = [
+	[0, "maxTextureDimension1D", "u32"],
+	[4, "maxTextureDimension2D", "u32"],
+	[8, "maxTextureDimension3D", "u32"],
+	[12, "maxTextureArrayLayers", "u32"],
+	[16, "maxBindGroups", "u32"],
+	[20, "maxBindGroupsPlusVertexBuffers", "u32"],
+	[24, "maxBindingsPerBindGroup", "u32"],
+	[28, "maxDynamicUniformBuffersPerPipelineLayout", "u32"],
+	[32, "maxDynamicStorageBuffersPerPipelineLayout", "u32"],
+	[36, "maxSampledTexturesPerShaderStage", "u32"],
+	[40, "maxSamplersPerShaderStage", "u32"],
+	[44, "maxStorageBuffersPerShaderStage", "u32"],
+	[48, "maxStorageTexturesPerShaderStage", "u32"],
+	[52, "maxUniformBuffersPerShaderStage", "u32"],
+	// padding to 8-byte alignment at 56
+	[56, "maxUniformBufferBindingSize", "u64"],
+	[64, "maxStorageBufferBindingSize", "u64"],
+	[72, "minUniformBufferOffsetAlignment", "u32"],
+	[76, "minStorageBufferOffsetAlignment", "u32"],
+	[80, "maxVertexBuffers", "u32"],
+	// padding at 84
+	[88, "maxBufferSize", "u64"],
+	[96, "maxVertexAttributes", "u32"],
+	[100, "maxVertexBufferArrayStride", "u32"],
+	[104, "maxInterStageShaderVariables", "u32"],
+	[108, "maxColorAttachments", "u32"],
+	[112, "maxColorAttachmentBytesPerSample", "u32"],
+	[116, "maxComputeWorkgroupStorageSize", "u32"],
+	[120, "maxComputeInvocationsPerWorkgroup", "u32"],
+	[124, "maxComputeWorkgroupSizeX", "u32"],
+	[128, "maxComputeWorkgroupSizeY", "u32"],
+	[132, "maxComputeWorkgroupSizeZ", "u32"],
+	[136, "maxComputeWorkgroupsPerDimension", "u32"],
+];
+
 class GPUAdapter {
 	instancePtr: number;
 	surfacePtr: number;
+	adapterPtr: number = 0;
 	features = new Set<string>();
 	limits: Record<string, number> = {};
 	info: Record<string, string> = {};
@@ -2083,19 +2851,70 @@ class GPUAdapter {
 		this.instancePtr = instancePtr;
 		this.surfacePtr = surfacePtr;
 	}
-	async requestDevice() {
+	_populateFeatures() {
+		if (!this.adapterPtr) return;
+		for (const [enumVal, name] of WGPU_FEATURE_MAP) {
+			try {
+				const has = WGPUNative.symbols.wgpuAdapterHasFeature(
+					this.adapterPtr,
+					enumVal,
+				);
+				if (has) this.features.add(name);
+			} catch {}
+		}
+	}
+	_populateLimits() {
+		if (!this.adapterPtr) return;
+		try {
+			// WGPUSupportedLimits = { nextInChain(8), WGPULimits limits }
+			// WGPULimits is ~140 bytes. Allocate 256 to be safe.
+			const buf = new ArrayBuffer(256);
+			const view = new DataView(buf);
+			writePtr(view, 0, null); // nextInChain = null
+			WGPU_KEEPALIVE.push(buf);
+			WGPUNative.symbols.wgpuAdapterGetLimits(
+				this.adapterPtr,
+				ptr(buf) as any,
+			);
+			// WGPULimits starts at offset 8 (after nextInChain ptr)
+			const limitsBase = 8;
+			for (const [offset, name, type] of WGPU_LIMITS_LAYOUT) {
+				if (type === "u32") {
+					this.limits[name] = view.getUint32(limitsBase + offset, true);
+				} else {
+					this.limits[name] = Number(
+						view.getBigUint64(limitsBase + offset, true),
+					);
+				}
+			}
+		} catch {}
+	}
+	async requestDevice(descriptor?: {
+		requiredFeatures?: string[];
+	}) {
 		const adapterDevice = new BigUint64Array(2);
 		WGPUBridge.createAdapterDeviceMainThread(
 			this.instancePtr as any,
 			this.surfacePtr as any,
 			ptr(adapterDevice),
 		);
+		this.adapterPtr = Number(adapterDevice[0]);
 		const devicePtr = adapterDevice[1];
 		if (devicePtr === 0n) {
 			throw new Error("Failed to create WGPU device");
 		}
-		const device = Number(devicePtr);
-		return new GPUDevice(device, this.instancePtr);
+		// Populate adapter features and limits now that we have the adapter ptr
+		this._populateFeatures();
+		this._populateLimits();
+
+		const device = new GPUDevice(Number(devicePtr), this.instancePtr);
+		// Copy supported features to device (device gets all adapter features
+		// since we can't pass requiredFeatures through the C++ path yet)
+		for (const f of this.features) {
+			device.features.add(f);
+		}
+		Object.assign(device.limits, this.limits);
+		return device;
 	}
 }
 
@@ -3010,6 +3829,14 @@ export {
 	GPUCommandEncoder,
 	GPUCommandBuffer,
 	GPURenderPassEncoder,
+	GPUComputePassEncoder,
+	GPUQuerySet,
+	GPUError,
+	GPUValidationError,
+	GPUOutOfMemoryError,
+	GPUInternalError,
+	DEVICE_REGISTRY,
+	uncapturedErrorCallback,
 	createCanvasShim,
 	decodePngRGBA,
 };
