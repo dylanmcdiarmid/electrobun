@@ -382,6 +382,7 @@ using namespace Microsoft::WRL;
 class AbstractView;
 class ContainerView;
 class NSWindow;
+static void clog(const char* fmt, ...);
 class NSStatusItem;
 class WKWebView;
 class MyScriptMessageHandlerWithReply;
@@ -1002,7 +1003,7 @@ public:
         SHORT ctrlState = GetKeyState(VK_CONTROL);
         bool isCtrlHeld = (ctrlState & 0x8000) != 0;
 
-        printf("[CEF OnBeforeBrowse] url=%s user_gesture=%d is_redirect=%d ctrlState=0x%04X isCtrlHeld=%d hasHandler=%d webviewId=%u\n",
+        clog("[CEF OnBeforeBrowse] url=%s user_gesture=%d is_redirect=%d ctrlState=0x%04X isCtrlHeld=%d hasHandler=%d webviewId=%u\n",
                url.c_str(), user_gesture, is_redirect, ctrlState, isCtrlHeld, webview_event_handler_ != nullptr, webview_id_);
 
         if (isCtrlHeld && !is_redirect && webview_event_handler_) {
@@ -1010,7 +1011,7 @@ public:
             auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count() / 1000.0;
 
-            printf("[CEF OnBeforeBrowse] Ctrl held! now=%.3f lastTime=%.3f diff=%.3f\n",
+            clog("[CEF OnBeforeBrowse] Ctrl held! now=%.3f lastTime=%.3f diff=%.3f\n",
                    now, lastCtrlClickTime, now - lastCtrlClickTime);
 
             if (now - lastCtrlClickTime >= 0.5) {
@@ -1028,12 +1029,12 @@ public:
 
                 std::string eventData = "{\"url\":\"" + escapedUrl +
                                        "\",\"isCmdClick\":true,\"modifierFlags\":0}";
-                printf("[CEF OnBeforeBrowse] Firing new-window-open: %s\n", eventData.c_str());
+                clog("[CEF OnBeforeBrowse] Firing new-window-open: %s\n", eventData.c_str());
                 // Use strdup to create persistent copies for the FFI callback
                 webview_event_handler_(webview_id_, _strdup("new-window-open"), _strdup(eventData.c_str()));
                 return true;  // Cancel navigation
             } else {
-                printf("[CEF OnBeforeBrowse] Debounced - too soon after last ctrl+click\n");
+                clog("[CEF OnBeforeBrowse] Debounced - too soon after last ctrl+click\n");
             }
         }
 
@@ -1106,23 +1107,23 @@ public:
         CefRefPtr<CefMediaAccessCallback> callback) override {
         
         std::string origin = requesting_origin.ToString();
-        printf("CEF: Media access permission requested for %s (permissions: %u)\n", origin.c_str(), requested_permissions);
+        clog("CEF: Media access permission requested for %s (permissions: %u)\n", origin.c_str(), requested_permissions);
         
         // Check cache first
         PermissionStatus cachedStatus = getPermissionFromCache(origin, PermissionType::USER_MEDIA);
         
         if (cachedStatus == PermissionStatus::ALLOWED) {
-            printf("CEF: Using cached permission: User previously allowed media access for %s\n", origin.c_str());
+            clog("CEF: Using cached permission: User previously allowed media access for %s\n", origin.c_str());
             callback->Continue(requested_permissions); // Allow all requested permissions
             return true;
         } else if (cachedStatus == PermissionStatus::DENIED) {
-            printf("CEF: Using cached permission: User previously blocked media access for %s\n", origin.c_str());
+            clog("CEF: Using cached permission: User previously blocked media access for %s\n", origin.c_str());
             callback->Cancel();
             return true;
         }
         
         // No cached permission, show dialog
-        printf("CEF: No cached permission found for %s, showing dialog\n", origin.c_str());
+        clog("CEF: No cached permission found for %s, showing dialog\n", origin.c_str());
         
         // Show Windows message box
         std::string message = "This page wants to access your camera and/or microphone.\n\nDo you want to allow this?";
@@ -1139,11 +1140,11 @@ public:
         if (result == IDYES) {
             callback->Continue(requested_permissions); // Allow all requested permissions
             cachePermission(origin, PermissionType::USER_MEDIA, PermissionStatus::ALLOWED);
-            printf("CEF: User allowed media access for %s (cached)\n", origin.c_str());
+            clog("CEF: User allowed media access for %s (cached)\n", origin.c_str());
         } else {
             callback->Cancel();
             cachePermission(origin, PermissionType::USER_MEDIA, PermissionStatus::DENIED);
-            printf("CEF: User blocked media access for %s (cached)\n", origin.c_str());
+            clog("CEF: User blocked media access for %s (cached)\n", origin.c_str());
         }
         
         return true; // We handled the permission request
@@ -1157,7 +1158,7 @@ public:
         CefRefPtr<CefPermissionPromptCallback> callback) override {
         
         std::string origin = requesting_origin.ToString();
-        printf("CEF: Permission prompt requested for %s (permissions: %u)\n", origin.c_str(), requested_permissions);
+        clog("CEF: Permission prompt requested for %s (permissions: %u)\n", origin.c_str(), requested_permissions);
         
         // Handle different permission types
         PermissionType permType = PermissionType::OTHER;
@@ -1184,17 +1185,17 @@ public:
         PermissionStatus cachedStatus = getPermissionFromCache(origin, permType);
         
         if (cachedStatus == PermissionStatus::ALLOWED) {
-            printf("CEF: Using cached permission: User previously allowed %s for %s\n", title.c_str(), origin.c_str());
+            clog("CEF: Using cached permission: User previously allowed %s for %s\n", title.c_str(), origin.c_str());
             callback->Continue(CEF_PERMISSION_RESULT_ACCEPT);
             return true;
         } else if (cachedStatus == PermissionStatus::DENIED) {
-            printf("CEF: Using cached permission: User previously blocked %s for %s\n", title.c_str(), origin.c_str());
+            clog("CEF: Using cached permission: User previously blocked %s for %s\n", title.c_str(), origin.c_str());
             callback->Continue(CEF_PERMISSION_RESULT_DENY);
             return true;
         }
         
         // No cached permission, show dialog
-        printf("CEF: No cached permission found for %s, showing dialog\n", origin.c_str());
+        clog("CEF: No cached permission found for %s, showing dialog\n", origin.c_str());
         
         // Show Windows message box
         int result = MessageBoxA(
@@ -1208,11 +1209,11 @@ public:
         if (result == IDYES) {
             callback->Continue(CEF_PERMISSION_RESULT_ACCEPT);
             cachePermission(origin, permType, PermissionStatus::ALLOWED);
-            printf("CEF: User allowed %s for %s (cached)\n", title.c_str(), origin.c_str());
+            clog("CEF: User allowed %s for %s (cached)\n", title.c_str(), origin.c_str());
         } else {
             callback->Continue(CEF_PERMISSION_RESULT_DENY);
             cachePermission(origin, permType, PermissionStatus::DENIED);
-            printf("CEF: User blocked %s for %s (cached)\n", title.c_str(), origin.c_str());
+            clog("CEF: User blocked %s for %s (cached)\n", title.c_str(), origin.c_str());
         }
         
         return true; // We handled the permission request
@@ -1223,7 +1224,7 @@ public:
         uint64_t prompt_id,
         cef_permission_request_result_t result) override {
         
-        printf("CEF: Permission prompt %I64u dismissed with result %d\n", prompt_id, result);
+        clog("CEF: Permission prompt %I64u dismissed with result %d\n", prompt_id, result);
         // Optional: Handle prompt dismissal if needed
     }
 
@@ -1288,7 +1289,7 @@ public:
                       const std::vector<CefString>& accept_descriptions,
                       CefRefPtr<CefFileDialogCallback> callback) override {
         
-        printf("CEF Windows: File dialog requested - mode: %d\n", static_cast<int>(mode));
+        clog("CEF Windows: File dialog requested - mode: %d\n", static_cast<int>(mode));
         
         // Run file dialog on main thread using Windows native dialog
         HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -1419,7 +1420,7 @@ public:
         // Call the callback with results
         callback->Continue(file_paths);
         
-        printf("CEF Windows: File dialog completed with %zu files selected\n", file_paths.size());
+        clog("CEF Windows: File dialog completed with %zu files selected\n", file_paths.size());
         return true; // We handled the dialog
     }
     
@@ -1436,7 +1437,7 @@ public:
                           CefRefPtr<CefDownloadItem> download_item,
                           const CefString& suggested_name,
                           CefRefPtr<CefBeforeDownloadCallback> callback) override {
-        printf("CEF Windows: OnBeforeDownload for %s\n", suggested_name.ToString().c_str());
+        clog("CEF Windows: OnBeforeDownload for %s\n", suggested_name.ToString().c_str());
 
         // Get the Downloads folder using Windows API
         wchar_t* downloadsPath = nullptr;
@@ -1473,14 +1474,14 @@ public:
             std::string utf8Path(size - 1, '\0');
             WideCharToMultiByte(CP_UTF8, 0, destPath.c_str(), -1, &utf8Path[0], size, nullptr, nullptr);
 
-            printf("CEF Windows: Downloading to %s\n", utf8Path.c_str());
+            clog("CEF Windows: Downloading to %s\n", utf8Path.c_str());
 
             // Continue the download to the specified path without showing a dialog
             callback->Continue(utf8Path, false);
 
             CoTaskMemFree(downloadsPath);
         } else {
-            printf("CEF Windows: Could not get Downloads folder, using default behavior\n");
+            clog("CEF Windows: Could not get Downloads folder, using default behavior\n");
             callback->Continue("", false);
         }
 
@@ -1491,13 +1492,13 @@ public:
                            CefRefPtr<CefDownloadItem> download_item,
                            CefRefPtr<CefDownloadItemCallback> callback) override {
         if (download_item->IsComplete()) {
-            printf("CEF Windows: Download complete - %s\n", download_item->GetFullPath().ToString().c_str());
+            clog("CEF Windows: Download complete - %s\n", download_item->GetFullPath().ToString().c_str());
         } else if (download_item->IsCanceled()) {
-            printf("CEF Windows: Download canceled\n");
+            clog("CEF Windows: Download canceled\n");
         } else if (download_item->IsInProgress()) {
             int percent = download_item->GetPercentComplete();
             if (percent >= 0 && percent % 25 == 0) {  // Log at 0%, 25%, 50%, 75%, 100%
-                printf("CEF Windows: Download progress %d%%\n", percent);
+                clog("CEF Windows: Download progress %d%%\n", percent);
             }
         }
     }
@@ -1607,13 +1608,13 @@ public:
     // Handle mouse events and forward to CEF
     void HandleMouseEvent(UINT message, WPARAM wParam, LPARAM lParam) {
         if (!browser_) {
-            printf("OSRWindow: No browser set!\n");
+            clog("OSRWindow: No browser set!\n");
             return;
         }
 
         CefRefPtr<CefBrowserHost> host = browser_->GetHost();
         if (!host) {
-            printf("OSRWindow: No browser host!\n");
+            clog("OSRWindow: No browser host!\n");
             return;
         }
 
@@ -1639,7 +1640,7 @@ public:
                     (message == WM_LBUTTONDOWN) ? MBT_LEFT :
                     (message == WM_RBUTTONDOWN) ? MBT_RIGHT : MBT_MIDDLE;
 
-                printf("OSRWindow: Sending click at (%d, %d)\n", mouse_event.x, mouse_event.y);
+                clog("OSRWindow: Sending click at (%d, %d)\n", mouse_event.x, mouse_event.y);
 
                 host->SendMouseClickEvent(mouse_event, btn_type, false, 1);
                 break;
@@ -2419,16 +2420,92 @@ void log(const std::string& message) {
     std::time_t now = std::time(0);
     std::string timeStr = std::ctime(&now);
     timeStr.pop_back(); // Remove newline character
-    
-    // Print to console
+
+    // Print to console (TeeStreamBuf mirrors to app.log automatically)
     std::cout << "[" << timeStr << "] " << message << std::endl;
-    
-    // Optionally write to file
-    std::ofstream logFile("app.log", std::ios::app);
-    if (logFile.is_open()) {
-        logFile << "[" << timeStr << "] " << message << std::endl;
-        logFile.close();
+}
+
+// printf-style logging that goes through std::cerr (captured by TeeStreamBuf → app.log).
+// Use this instead of clog() so output isn't lost to a hidden console.
+static void clog(const char* fmt, ...) {
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    // Strip trailing newline if present — cerr << endl adds one
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r')) {
+        buf[--len] = '\0';
     }
+    std::cerr << buf << std::endl;
+}
+
+// Tee streambuf: writes to both the original stream AND app.log.
+// Installed on cout/cerr so ALL C++ output (printf via CRT, cout, cerr)
+// is mirrored to app.log for LLM agents to read from WSL.
+class TeeStreamBuf : public std::streambuf {
+    std::streambuf* original;
+    std::string lineBuffer;
+protected:
+    int overflow(int c) override {
+        if (c == EOF) return c;
+        // Always write to original stream
+        if (original) original->sputc(c);
+        // Buffer lines and flush to app.log on newline
+        if (c == '\n') {
+            std::ofstream logFile("app.log", std::ios::app);
+            if (logFile.is_open()) {
+                logFile << lineBuffer << '\n';
+            }
+            lineBuffer.clear();
+        } else {
+            lineBuffer += static_cast<char>(c);
+        }
+        return c;
+    }
+    int sync() override {
+        if (original) original->pubsync();
+        if (!lineBuffer.empty()) {
+            std::ofstream logFile("app.log", std::ios::app);
+            if (logFile.is_open()) {
+                logFile << lineBuffer;
+                logFile.flush();
+            }
+            lineBuffer.clear();
+        }
+        return 0;
+    }
+public:
+    TeeStreamBuf(std::streambuf* orig) : original(orig) {}
+};
+
+// Also intercept C-level stderr (fprintf, printf routed to stderr) via a
+// pipe that reads into app.log. For printf to stdout, cout's tee handles it
+// since CRT stdout and cout share a buffer on MSVC.
+static TeeStreamBuf* g_coutTee = nullptr;
+static TeeStreamBuf* g_cerrTee = nullptr;
+
+static void installLogTee() {
+    // Tee std::cout → app.log
+    g_coutTee = new TeeStreamBuf(std::cout.rdbuf());
+    std::cout.rdbuf(g_coutTee);
+    // Tee std::cerr → app.log
+    g_cerrTee = new TeeStreamBuf(std::cerr.rdbuf());
+    std::cerr.rdbuf(g_cerrTee);
+    // For C-level fprintf(stderr, ...), redirect stderr file descriptor to also
+    // write to app.log. On Windows MSVC, we can reopen stderr to a file, but
+    // that loses console output. Instead, we rely on the fact that most C++
+    // output goes through cout/cerr, and wgpu_log already writes to app.log.
+    // C-level printf goes to stdout which shares the cout buffer on MSVC.
+}
+
+// Call this early — e.g., from the first exported function or DLL init.
+static bool g_logTeeInstalled = false;
+static void ensureLogTee() {
+    if (g_logTeeInstalled) return;
+    g_logTeeInstalled = true;
+    installLogTee();
 }
 
 // Generic Bridge Handler COM Object - can be used for any bridge type
@@ -2488,13 +2565,13 @@ public:
     HRESULT STDMETHODCALLTYPE Invoke(DISPID dispIdMember, REFIID riid, LCID lcid, WORD wFlags, DISPPARAMS* pDispParams, VARIANT* pVarResult, EXCEPINFO* pExcepInfo, UINT* puArgErr) override {
         if (dispIdMember == 1 && (wFlags & DISPATCH_METHOD)) { // postMessage method
             if (pDispParams->cArgs == 1 && pDispParams->rgvarg[0].vt == VT_BSTR) {
-                printf("[Bridge:%s] Received message for webview %u\n", m_bridgeName.c_str(), m_webviewId);
+                clog("[Bridge:%s] Received message for webview %u\n", m_bridgeName.c_str(), m_webviewId);
                 return PostMessage(pDispParams->rgvarg[0].bstrVal);
             }
-            printf("[Bridge:%s] Bad param count for webview %u\n", m_bridgeName.c_str(), m_webviewId);
+            clog("[Bridge:%s] Bad param count for webview %u\n", m_bridgeName.c_str(), m_webviewId);
             return DISP_E_BADPARAMCOUNT;
         }
-        printf("[Bridge:%s] Unknown method DISPID=%ld for webview %u\n", m_bridgeName.c_str(), (long)dispIdMember, m_webviewId);
+        clog("[Bridge:%s] Unknown method DISPID=%ld for webview %u\n", m_bridgeName.c_str(), (long)dispIdMember, m_webviewId);
         return DISP_E_MEMBERNOTFOUND;
     }
 
@@ -4899,7 +4976,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     auto cefView = static_cast<CEFView*>(viewIt->second);
                     if (cefView && cefView->isOSRMode()) {
                         if (msg == WM_LBUTTONDOWN) {
-                            printf("WindowProc: WM_LBUTTONDOWN received for OSR window\n");
+                            clog("WindowProc: WM_LBUTTONDOWN received for OSR window\n");
                         }
                         cefView->HandleWindowMessage(msg, wParam, lParam);
                     }
@@ -5793,6 +5870,7 @@ void TerminateCEFHelperProcesses() {
 }
 
 ELECTROBUN_EXPORT bool initCEF() {
+    ensureLogTee();
     if (g_cef_initialized) {
         return true; // Already initialized
     }
@@ -6190,7 +6268,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                             webview->add_NavigationStarting(
                                 Callback<ICoreWebView2NavigationStartingEventHandler>(
                                     [capturedWebviewId, capturedHandler](ICoreWebView2* sender, ICoreWebView2NavigationStartingEventArgs* args) -> HRESULT {
-                                        printf("[WebView2] NavigationStarting fired for webview %u\n", capturedWebviewId);
+                                        clog("[WebView2] NavigationStarting fired for webview %u\n", capturedWebviewId);
                                         // Get URL first - needed for both ctrl+click and navigation rules
                                         wchar_t* uriWStr = nullptr;
                                         args->get_Uri(&uriWStr);
@@ -6210,7 +6288,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
 
                                         // Handle Ctrl+click for new window
                                         if (isCtrlHeld && capturedHandler) {
-                                            printf("[WebView2 NavigationStarting] Ctrl+click detected, url=%s\n", uri.c_str());
+                                            clog("[WebView2 NavigationStarting] Ctrl+click detected, url=%s\n", uri.c_str());
 
                                             // Debounce: ignore ctrl+click navigations within 500ms
                                             auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -6231,13 +6309,13 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
 
                                                 std::string eventData = "{\"url\":\"" + escapedUrl +
                                                                        "\",\"isCmdClick\":true,\"modifierFlags\":0}";
-                                                printf("[WebView2 NavigationStarting] Firing new-window-open: %s\n", eventData.c_str());
+                                                clog("[WebView2 NavigationStarting] Firing new-window-open: %s\n", eventData.c_str());
                                                 capturedHandler(capturedWebviewId, _strdup("new-window-open"), _strdup(eventData.c_str()));
 
                                                 args->put_Cancel(TRUE);
                                                 return S_OK;
                                             } else {
-                                                printf("[WebView2 NavigationStarting] Debounced\n");
+                                                clog("[WebView2 NavigationStarting] Debounced\n");
                                             }
                                         }
 
@@ -6280,7 +6358,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                             webview->add_NavigationCompleted(
                                 Callback<ICoreWebView2NavigationCompletedEventHandler>(
                                     [capturedWebviewId, capturedHandler](ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
-                                        printf("[WebView2] NavigationCompleted fired for webview %u\n", capturedWebviewId);
+                                        clog("[WebView2] NavigationCompleted fired for webview %u\n", capturedWebviewId);
                                         // Get current URL
                                         wchar_t* uriWStr = nullptr;
                                         sender->get_Source(&uriWStr);
@@ -6368,23 +6446,23 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                                                     break;
                                             }
                                             
-                                            printf("WebView2: %s requested for %s\n", permissionName.c_str(), origin.c_str());
+                                            clog("WebView2: %s requested for %s\n", permissionName.c_str(), origin.c_str());
                                             
                                             // Check cache first
                                             PermissionStatus cachedStatus = getPermissionFromCache(origin, permType);
                                             
                                             if (cachedStatus == PermissionStatus::ALLOWED) {
-                                                printf("WebView2: Using cached permission: User previously allowed %s for %s\n", permissionName.c_str(), origin.c_str());
+                                                clog("WebView2: Using cached permission: User previously allowed %s for %s\n", permissionName.c_str(), origin.c_str());
                                                 args->put_State(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
                                                 return S_OK;
                                             } else if (cachedStatus == PermissionStatus::DENIED) {
-                                                printf("WebView2: Using cached permission: User previously blocked %s for %s\n", permissionName.c_str(), origin.c_str());
+                                                clog("WebView2: Using cached permission: User previously blocked %s for %s\n", permissionName.c_str(), origin.c_str());
                                                 args->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY);
                                                 return S_OK;
                                             }
                                             
                                             // No cached permission, show dialog
-                                            printf("WebView2: No cached permission found for %s, showing dialog\n", origin.c_str());
+                                            clog("WebView2: No cached permission found for %s, showing dialog\n", origin.c_str());
                                             
                                             std::string message = "This page wants to access ";
                                             switch (kind) {
@@ -6417,11 +6495,11 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                                             if (result == IDYES) {
                                                 args->put_State(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
                                                 cachePermission(origin, permType, PermissionStatus::ALLOWED);
-                                                printf("WebView2: User allowed %s for %s (cached)\n", permissionName.c_str(), origin.c_str());
+                                                clog("WebView2: User allowed %s for %s (cached)\n", permissionName.c_str(), origin.c_str());
                                             } else {
                                                 args->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY);
                                                 cachePermission(origin, permType, PermissionStatus::DENIED);
-                                                printf("WebView2: User blocked %s for %s (cached)\n", permissionName.c_str(), origin.c_str());
+                                                clog("WebView2: User blocked %s for %s (cached)\n", permissionName.c_str(), origin.c_str());
                                             }
                                             
                                             return S_OK;
@@ -6439,7 +6517,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                                     webview4->add_DownloadStarting(
                                         Callback<ICoreWebView2DownloadStartingEventHandler>(
                                             [](ICoreWebView2* sender, ICoreWebView2DownloadStartingEventArgs* args) -> HRESULT {
-                                                printf("WebView2: Download starting\n");
+                                                clog("WebView2: Download starting\n");
 
                                                 // Get the download operation
                                                 Microsoft::WRL::ComPtr<ICoreWebView2DownloadOperation> downloadOp;
@@ -6524,12 +6602,12 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                                                         if (size > 0) {
                                                             std::string utf8Path(size - 1, '\0');
                                                             WideCharToMultiByte(CP_UTF8, 0, destPath.c_str(), -1, &utf8Path[0], size, nullptr, nullptr);
-                                                            printf("WebView2: Downloading to %s\n", utf8Path.c_str());
+                                                            clog("WebView2: Downloading to %s\n", utf8Path.c_str());
                                                         }
 
                                                         CoTaskMemFree(downloadsPath);
                                                     } else {
-                                                        printf("WebView2: Could not get Downloads folder, using default behavior\n");
+                                                        clog("WebView2: Could not get Downloads folder, using default behavior\n");
                                                     }
 
                                                     if (uriWStr) CoTaskMemFree(uriWStr);
@@ -6539,9 +6617,9 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
                                                 return S_OK;
                                             }).Get(),
                                         nullptr);
-                                    printf("WebView2: Download handler registered successfully\n");
+                                    clog("WebView2: Download handler registered successfully\n");
                                 } else {
-                                    printf("WebView2: Warning - Could not get ICoreWebView2_4 interface for download handling\n");
+                                    clog("WebView2: Warning - Could not get ICoreWebView2_4 interface for download handling\n");
                                 }
 
                             } else {
@@ -6684,7 +6762,7 @@ static std::shared_ptr<WebView2View> createWebView2View(uint32_t webviewId,
 // Utility function for creating CEF request contexts with partition support
 CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partitionIdentifier,
                                                                uint32_t webviewId) {
-    printf("DEBUG CEF: CreateRequestContextForPartition called for webview %u, partition: %s\n",
+    clog("DEBUG CEF: CreateRequestContextForPartition called for webview %u, partition: %s\n",
            webviewId, partitionIdentifier ? partitionIdentifier : "null");
 
     CefRequestContextSettings settings;
@@ -6703,7 +6781,7 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
             // Get %LOCALAPPDATA% path
             char* localAppData = getenv("LOCALAPPDATA");
             if (!localAppData) {
-                printf("ERROR CEF: LOCALAPPDATA not found, falling back to in-memory session\n");
+                clog("ERROR CEF: LOCALAPPDATA not found, falling back to in-memory session\n");
                 settings.persist_session_cookies = false;
             } else {
                 // Build path with identifier/channel structure (consistent with CLI and updater)
@@ -6717,13 +6795,13 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
                 settings.persist_session_cookies = true;
                 CefString(&settings.cache_path).FromString(cachePath);
 
-                printf("DEBUG CEF: Persistent partition '%s' using cache path: %s\n",
+                clog("DEBUG CEF: Persistent partition '%s' using cache path: %s\n",
                        partitionName.c_str(), cachePath.c_str());
             }
         } else {
             // Non-persistent partition - in-memory session
             settings.persist_session_cookies = false;
-            printf("DEBUG CEF: In-memory partition '%s'\n", identifier.c_str());
+            clog("DEBUG CEF: In-memory partition '%s'\n", identifier.c_str());
         }
     }
 
@@ -6734,7 +6812,7 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
     // Note: Each CefRequestContext needs its own registration - it's not global
     static CefRefPtr<ElectrobunSchemeHandlerFactory> schemeFactory = new ElectrobunSchemeHandlerFactory();
     bool registered = context->RegisterSchemeHandlerFactory("views", "", schemeFactory);
-    printf("DEBUG CEF: Registered scheme handler factory for partition '%s' - success: %s\n",
+    clog("DEBUG CEF: Registered scheme handler factory for partition '%s' - success: %s\n",
            partitionIdentifier ? partitionIdentifier : "(default)", registered ? "yes" : "no");
 
     return context;
@@ -6902,7 +6980,7 @@ static std::shared_ptr<CEFView> createCEFView(uint32_t webviewId,
             g_cefClients[mapKey] = client;
             g_cefViews[mapKey] = view.get();
 
-            printf("CEF: Registered view with hwnd=%p (transparent=%d)\n", mapKey, transparent);
+            clog("CEF: Registered view with hwnd=%p (transparent=%d)\n", mapKey, transparent);
 
             // Set browser on client for script execution
             client->SetBrowser(browser);
@@ -7382,18 +7460,34 @@ static PFN_wgpuBufferUnmap p_wgpuBufferUnmap = nullptr;
 
 // ----------------------- WGPU GPU Test (native cube) -----------------------
 
-// Helper for formatted WGPU test logging
-// Uses fprintf(stderr) + fflush for immediate visibility, plus the normal log() for file output
+// Rate-limited WGPU logger — writes through std::cerr (captured by TeeStreamBuf → app.log).
+// Suppresses output after 20 messages per second to prevent log flooding
+// from per-frame errors (e.g., missing feature validation failures).
 static void wgpu_log(const char* fmt, ...) {
+    static int msgCount = 0;
+    static auto windowStart = std::chrono::steady_clock::now();
+    static const int MAX_PER_SEC = 20;
+
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - windowStart).count();
+    if (elapsed > 1000) {
+        if (msgCount > MAX_PER_SEC) {
+            std::cerr << "[WGPU] (suppressed " << (msgCount - MAX_PER_SEC) << " messages in last second)" << std::endl;
+            fflush(stderr);
+        }
+        msgCount = 0;
+        windowStart = now;
+    }
+    msgCount++;
+    if (msgCount > MAX_PER_SEC) return;
+
     char buf[512];
     va_list args;
     va_start(args, fmt);
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-    fprintf(stderr, "[WGPU] %s\n", buf);
-    fflush(stderr);
-    std::cout << "[WGPU] " << buf << std::endl;
-    std::cout.flush();
+    // Write to cerr (which tees to app.log via TeeStreamBuf)
+    std::cerr << "[WGPU] " << buf << std::endl;
 }
 
 // Additional typedefs for the GPU test (matches macOS reference)
@@ -7923,14 +8017,14 @@ ELECTROBUN_EXPORT void* wgpuInstanceCreateSurfaceMainThread(void* instance, void
 
 ELECTROBUN_EXPORT void* wgpuCreateSurfaceForView(void* wgpuInstance, AbstractView* abstractView) {
     if (!wgpuInstance || !abstractView || !abstractView->hwnd) {
-        printf("[WGPU] createSurfaceForView: null check failed (inst=%p view=%p hwnd=%p)\n",
+        clog("[WGPU] createSurfaceForView: null check failed (inst=%p view=%p hwnd=%p)\n",
                wgpuInstance, abstractView, abstractView ? abstractView->hwnd : nullptr);
         return nullptr;
     }
     if (!ensureWgpuSymbols()) return nullptr;
 
     HWND hwnd = abstractView->hwnd;
-    printf("[WGPU] createSurfaceForView: creating surface for HWND=%p\n", hwnd);
+    clog("[WGPU] createSurfaceForView: creating surface for HWND=%p\n", hwnd);
     void* result = runOnMainThreadSyncPtr([&]() -> void* {
         WGPUSurfaceSourceWindowsHWND hwndSource = {};
         hwndSource.chain.sType = WGPUSType_SurfaceSourceWindowsHWND;
@@ -7941,7 +8035,7 @@ ELECTROBUN_EXPORT void* wgpuCreateSurfaceForView(void* wgpuInstance, AbstractVie
         surfaceDesc.nextInChain = reinterpret_cast<WGPUChainedStruct*>(&hwndSource);
         return p_wgpuInstanceCreateSurface(wgpuInstance, &surfaceDesc);
     });
-    printf("[WGPU] createSurfaceForView: surface=%p\n", result);
+    clog("[WGPU] createSurfaceForView: surface=%p\n", result);
     return result;
 }
 
@@ -7958,7 +8052,7 @@ ELECTROBUN_EXPORT void wgpuSurfaceGetCurrentTextureMainThread(void* surface, voi
         // Log status field (offset 16 in WGPUSurfaceTexture struct: texture(8) + suboptimal(4) + pad(4) + status(4))
         uint32_t status = *((uint32_t*)((uint8_t*)surfaceTexture + 16));
         void* texture = *((void**)surfaceTexture);
-        printf("[WGPU] getCurrentTexture[%d]: texture=%p status=%u\n", callCount, texture, status);
+        clog("[WGPU] getCurrentTexture[%d]: texture=%p status=%u\n", callCount, texture, status);
         callCount++;
     }
 }
@@ -7966,7 +8060,7 @@ ELECTROBUN_EXPORT void wgpuSurfaceGetCurrentTextureMainThread(void* surface, voi
 ELECTROBUN_EXPORT int32_t wgpuSurfacePresentMainThread(void* surface) {
     if (!ensureWgpuSymbols()) return 0;
     static bool logged = false;
-    if (!logged) { printf("[WGPU] surfacePresentMainThread: first present call, surface=%p\n", surface); logged = true; }
+    if (!logged) { clog("[WGPU] surfacePresentMainThread: first present call, surface=%p\n", surface); logged = true; }
     return (int32_t)(intptr_t)runOnMainThreadSyncPtr([&]() -> void* {
         return (void*)(intptr_t)p_wgpuSurfacePresent(surface);
     });
@@ -8267,8 +8361,8 @@ ELECTROBUN_EXPORT void wgpuRunGPUTest(void* abstractView) {
 }
 
 ELECTROBUN_EXPORT void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfacePtr, void* outAdapterDevice) {
-    printf("[WGPU] createAdapterDeviceMainThread: instance=%p surface=%p\n", instancePtr, surfacePtr);
-    if (!ensureWgpuTestSymbols()) { printf("[WGPU] createAdapterDeviceMainThread: ensureWgpuTestSymbols FAILED\n"); return; }
+    clog("[WGPU] createAdapterDeviceMainThread: instance=%p surface=%p\n", instancePtr, surfacePtr);
+    if (!ensureWgpuTestSymbols()) { clog("[WGPU] createAdapterDeviceMainThread: ensureWgpuTestSymbols FAILED\n"); return; }
     MainThreadDispatcher::dispatch_sync([instancePtr, surfacePtr, outAdapterDevice]() {
         WGPUInstance instance = (WGPUInstance)instancePtr;
         WGPUSurface surface = (WGPUSurface)surfacePtr;
@@ -8332,7 +8426,7 @@ ELECTROBUN_EXPORT void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void
         WaitForSingleObject(deviceEvent, INFINITE);
         CloseHandle(deviceEvent);
 
-        printf("[WGPU] createAdapterDeviceMainThread: adapter=%p device=%p\n", adapter, device);
+        clog("[WGPU] createAdapterDeviceMainThread: adapter=%p device=%p\n", adapter, device);
         if (outAdapterDevice) {
             uint64_t* out = (uint64_t*)outAdapterDevice;
             out[0] = (uint64_t)adapter;

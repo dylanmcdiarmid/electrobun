@@ -2555,42 +2555,27 @@ class GPUCommandEncoder {
 			depth = copySize.depthOrArrayLayers ?? 1;
 		}
 
-		// WGPUImageCopyTexture: nextInChain(8) + texture(8) + mipLevel(4) + origin{x,y,z}(12) + aspect(4) + pad(4) = 40
-		const srcBuf = new ArrayBuffer(40);
-		const srcView = new DataView(srcBuf);
-		writePtr(srcView, 0, null);
-		writePtr(srcView, 8, source.texture.ptr);
-		writeU32(srcView, 16, source.mipLevel ?? 0);
-		writeU32(srcView, 20, ox);
-		writeU32(srcView, 24, oy);
-		writeU32(srcView, 28, oz);
-		writeU32(srcView, 32, 0); // WGPUTextureAspect_All = 0
-		WGPU_KEEPALIVE.push(srcBuf);
-
-		// WGPUImageCopyBuffer: nextInChain(8) + layout{nextInChain(8)+offset(8)+bytesPerRow(4)+rowsPerImage(4)} + buffer(8) = 40
-		const dstBuf = new ArrayBuffer(40);
-		const dstView = new DataView(dstBuf);
-		writePtr(dstView, 0, null);
-		writePtr(dstView, 8, null); // layout.nextInChain
-		writeU64(dstView, 16, destination.offset ?? 0);
-		writeU32(dstView, 24, destination.bytesPerRow);
-		writeU32(dstView, 28, destination.rowsPerImage ?? 0);
-		writePtr(dstView, 32, destination.buffer.ptr);
-		WGPU_KEEPALIVE.push(dstBuf);
-
-		// WGPUExtent3D: width(4) + height(4) + depthOrArrayLayers(4) = 12
-		const sizeBuf = new ArrayBuffer(12);
-		const sizeView = new DataView(sizeBuf);
-		writeU32(sizeView, 0, width);
-		writeU32(sizeView, 4, height);
-		writeU32(sizeView, 8, depth);
-		WGPU_KEEPALIVE.push(sizeBuf);
+		// Use the same struct helpers as writeTexture — the Dawn binary uses the
+		// newer layout WITHOUT nextInChain fields.
+		const texInfo = makeTexelCopyTextureInfo(
+			source.texture.ptr,
+			source.mipLevel ?? 0,
+			{ x: ox, y: oy, z: oz },
+		);
+		const dstInfo = makeImageCopyBuffer(
+			destination.buffer.ptr,
+			destination.offset ?? 0,
+			destination.bytesPerRow,
+			destination.rowsPerImage ?? 0,
+		);
+		const extent = makeExtent3D(width, height, depth);
+		WGPU_KEEPALIVE.push(texInfo.buffer, dstInfo.buffer, extent.buffer);
 
 		WGPUNative.symbols.wgpuCommandEncoderCopyTextureToBuffer(
 			this.ptr,
-			ptr(srcBuf) as any,
-			ptr(dstBuf) as any,
-			ptr(sizeBuf) as any,
+			texInfo.ptr as any,
+			dstInfo.ptr as any,
+			extent.ptr as any,
 		);
 	}
 	copyBufferToBuffer(
@@ -3684,6 +3669,7 @@ function makeImageCopyBuffer(
 	bytesPerRow: number,
 	rowsPerImage: number,
 ) {
+	// Layout without nextInChain: offset(8) + bytesPerRow(4) + rowsPerImage(4) + buffer(8) = 24
 	const buffer = new ArrayBuffer(24);
 	const view = new DataView(buffer);
 	writeU64(view, 0, BigInt(offset));

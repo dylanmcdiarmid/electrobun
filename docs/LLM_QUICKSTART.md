@@ -243,6 +243,29 @@ if (!WGPU.native.available) throw new Error("WGPU not bundled");
 const instance = WGPU.native.symbols.wgpuCreateInstance(0);
 ```
 
+### Dawn Source Code Reference
+
+The Dawn source code is available locally at `/home/dylan/code/dawn`. **Always consult it when working with WebGPU FFI** — the prebuilt binary's API (struct layouts, enum values, function signatures) may differ from the upstream WebGPU spec.
+
+The prebuilt `electrobun-dawn` binary version is pinned in `package/build.ts` (`WGPU_VERSION`). The electrobun-dawn repo (https://github.com/blackboardsh/electrobun-dawn) pins a specific Dawn commit as a git submodule — check the release tag to find the exact commit hash, then fetch it locally:
+
+```bash
+# Find the Dawn commit for electrobun-dawn v0.2.3
+# (check https://github.com/blackboardsh/electrobun-dawn at tag v0.2.3)
+
+# Fetch and inspect it locally
+cd /home/dylan/code/dawn
+git fetch origin <commit-hash>
+git show <commit-hash>:src/dawn/dawn.json | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['<struct-name>'], indent=2))"
+```
+
+**The `dawn.json` file is the source of truth for the Dawn C API.** It defines all struct layouts, enum values, and function signatures. The C header (`webgpu.h`) is generated from it.
+
+Key things to verify against `dawn.json`:
+- **Struct layouts**: Check `"extensible"` field — if absent, the struct has NO `nextInChain` pointer. Newer Dawn "info" structs (like `texel copy texture info`) lack `nextInChain`, while "descriptor" structs still have it.
+- **Enum/bitmask values**: Dawn's values may differ from the WebGPU spec. For example, texture `COPY_SRC` is `1` in Dawn but `4` in the spec.
+- **Function argument types**: Method definitions in `dawn.json` show the exact struct types each function expects (e.g., `texel copy buffer info` vs the old `image copy buffer`).
+
 ### Engine Integrations
 
 Electrobun re-exports `three` (Three.js) and `@babylonjs/core` (Babylon.js) for convenience. Use `webgpu.install()` and a canvas shim to render via `WebGPURenderer` or `WebGPUEngine`. See the WebGPU docs for full examples.
