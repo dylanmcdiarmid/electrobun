@@ -2158,7 +2158,31 @@ async function generateTemplateEmbeddings() {
 	const electrobunVersion = electrobunPackageJson.version;
 
 	if (!existsSync(TEMPLATES_DIR)) {
-		console.log("No templates directory found, skipping template generation");
+		console.log(
+			"No templates directory found, generating stub embedded.ts",
+		);
+		const stubOutput = `// Auto-generated stub. No templates directory was found at build time.
+
+export interface Template {
+  name: string;
+  files: Record<string, string>;
+}
+
+export const templates: Record<string, Template> = {};
+
+export function getTemplateNames(): string[] {
+  return [];
+}
+
+export function getTemplate(name: string): Template | undefined {
+  return templates[name];
+}
+`;
+		const outputDir = dirname(OUTPUT_FILE);
+		if (!existsSync(outputDir)) {
+			mkdirSync(outputDir, { recursive: true });
+		}
+		writeFileSync(OUTPUT_FILE, stubOutput);
 		return;
 	}
 
