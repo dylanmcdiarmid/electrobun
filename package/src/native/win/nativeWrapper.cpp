@@ -2441,22 +2441,26 @@ static void clog(const char* fmt, ...) {
     std::cerr << buf << std::endl;
 }
 
-// Tee streambuf: writes to both the original stream AND app.log.
-// Installed on cout/cerr so ALL C++ output (printf via CRT, cout, cerr)
-// is mirrored to app.log for LLM agents to read from WSL.
+// Path to the log file that mirrors all console output. Defaults to "app.log"
+// (relative to the process working directory, typically the bin/ folder).
+// Set via setLogFilePath() before initCEF() to change.
+static std::string g_logFilePath = "app.log";
+
+// Tee streambuf: writes to both the original stream AND the log file.
+// Installed on cout/cerr so ALL C++ output is mirrored for LLM agents.
 class TeeStreamBuf : public std::streambuf {
     std::streambuf* original;
     std::string lineBuffer;
 protected:
     int overflow(int c) override {
         if (c == EOF) return c;
-        // Always write to original stream
         if (original) original->sputc(c);
-        // Buffer lines and flush to app.log on newline
         if (c == '\n') {
-            std::ofstream logFile("app.log", std::ios::app);
-            if (logFile.is_open()) {
-                logFile << lineBuffer << '\n';
+            if (!g_logFilePath.empty()) {
+                std::ofstream logFile(g_logFilePath, std::ios::app);
+                if (logFile.is_open()) {
+                    logFile << lineBuffer << '\n';
+                }
             }
             lineBuffer.clear();
         } else {
@@ -2466,8 +2470,8 @@ protected:
     }
     int sync() override {
         if (original) original->pubsync();
-        if (!lineBuffer.empty()) {
-            std::ofstream logFile("app.log", std::ios::app);
+        if (!lineBuffer.empty() && !g_logFilePath.empty()) {
+            std::ofstream logFile(g_logFilePath, std::ios::app);
             if (logFile.is_open()) {
                 logFile << lineBuffer;
                 logFile.flush();
@@ -2480,32 +2484,31 @@ public:
     TeeStreamBuf(std::streambuf* orig) : original(orig) {}
 };
 
-// Also intercept C-level stderr (fprintf, printf routed to stderr) via a
-// pipe that reads into app.log. For printf to stdout, cout's tee handles it
-// since CRT stdout and cout share a buffer on MSVC.
 static TeeStreamBuf* g_coutTee = nullptr;
 static TeeStreamBuf* g_cerrTee = nullptr;
 
 static void installLogTee() {
-    // Tee std::cout → app.log
     g_coutTee = new TeeStreamBuf(std::cout.rdbuf());
     std::cout.rdbuf(g_coutTee);
-    // Tee std::cerr → app.log
     g_cerrTee = new TeeStreamBuf(std::cerr.rdbuf());
     std::cerr.rdbuf(g_cerrTee);
-    // For C-level fprintf(stderr, ...), redirect stderr file descriptor to also
-    // write to app.log. On Windows MSVC, we can reopen stderr to a file, but
-    // that loses console output. Instead, we rely on the fact that most C++
-    // output goes through cout/cerr, and wgpu_log already writes to app.log.
-    // C-level printf goes to stdout which shares the cout buffer on MSVC.
 }
 
-// Call this early — e.g., from the first exported function or DLL init.
 static bool g_logTeeInstalled = false;
 static void ensureLogTee() {
     if (g_logTeeInstalled) return;
     g_logTeeInstalled = true;
     installLogTee();
+}
+
+// Set the log file path. Call before initCEF() to take effect.
+// Pass null or empty string to disable file logging (console-only).
+extern "C" ELECTROBUN_EXPORT void setLogFilePath(const char* path) {
+    if (path && path[0] != '\0') {
+        g_logFilePath = path;
+    } else {
+        g_logFilePath.clear();
+    }
 }
 
 // Generic Bridge Handler COM Object - can be used for any bridge type
@@ -8360,10 +8363,14 @@ ELECTROBUN_EXPORT void wgpuRunGPUTest(void* abstractView) {
     });
 }
 
-ELECTROBUN_EXPORT void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void* surfacePtr, void* outAdapterDevice) {
-    clog("[WGPU] createAdapterDeviceMainThread: instance=%p surface=%p\n", instancePtr, surfacePtr);
+ELECTROBUN_EXPORT void wgpuCreateAdapterDeviceMainThread(
+    void* instancePtr, void* surfacePtr, void* outAdapterDevice,
+    uint32_t* requiredFeatures, uint32_t requiredFeatureCount,
+    void* requiredLimitsPtr) {
+    clog("[WGPU] createAdapterDeviceMainThread: instance=%p surface=%p featureCount=%u limitsPtr=%p\n",
+         instancePtr, surfacePtr, requiredFeatureCount, requiredLimitsPtr);
     if (!ensureWgpuTestSymbols()) { clog("[WGPU] createAdapterDeviceMainThread: ensureWgpuTestSymbols FAILED\n"); return; }
-    MainThreadDispatcher::dispatch_sync([instancePtr, surfacePtr, outAdapterDevice]() {
+    MainThreadDispatcher::dispatch_sync([instancePtr, surfacePtr, outAdapterDevice, requiredFeatures, requiredFeatureCount, requiredLimitsPtr]() {
         WGPUInstance instance = (WGPUInstance)instancePtr;
         WGPUSurface surface = (WGPUSurface)surfacePtr;
 
@@ -8422,6 +8429,15 @@ ELECTROBUN_EXPORT void wgpuCreateAdapterDeviceMainThread(void* instancePtr, void
         WGPUDeviceDescriptor deviceDesc = {};
         deviceDesc.uncapturedErrorCallbackInfo.callback = gpuTestUncapturedErrorCallback;
         deviceDesc.uncapturedErrorCallbackInfo.userdata1 = &deviceCtx;
+        if (requiredFeatures && requiredFeatureCount > 0) {
+            deviceDesc.requiredFeatureCount = requiredFeatureCount;
+            deviceDesc.requiredFeatures = (WGPUFeatureName*)requiredFeatures;
+            clog("[WGPU] createAdapterDeviceMainThread: requesting %u features\n", requiredFeatureCount);
+        }
+        if (requiredLimitsPtr) {
+            deviceDesc.requiredLimits = (WGPULimits*)requiredLimitsPtr;
+            clog("[WGPU] createAdapterDeviceMainThread: using custom limits\n");
+        }
         p_wgpuAdapterRequestDevice(adapter, &deviceDesc, deviceInfo);
         WaitForSingleObject(deviceEvent, INFINITE);
         CloseHandle(deviceEvent);

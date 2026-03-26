@@ -247,16 +247,15 @@ const instance = WGPU.native.symbols.wgpuCreateInstance(0);
 
 The Dawn source code is available locally at `/home/dylan/code/dawn`. **Always consult it when working with WebGPU FFI** — the prebuilt binary's API (struct layouts, enum values, function signatures) may differ from the upstream WebGPU spec.
 
-The prebuilt `electrobun-dawn` binary version is pinned in `package/build.ts` (`WGPU_VERSION`). The electrobun-dawn repo (https://github.com/blackboardsh/electrobun-dawn) pins a specific Dawn commit as a git submodule — check the release tag to find the exact commit hash, then fetch it locally:
+The prebuilt `electrobun-dawn` v0.2.3 binary was built from Dawn commit **`75beadd1f3ab1c541ae743ef943480f434983a4e`**. If the version changes, check `package/build.ts` (`WGPU_VERSION`) and the corresponding release at https://github.com/blackboardsh/electrobun-dawn to find the new commit.
 
 ```bash
-# Find the Dawn commit for electrobun-dawn v0.2.3
-# (check https://github.com/blackboardsh/electrobun-dawn at tag v0.2.3)
-
-# Fetch and inspect it locally
 cd /home/dylan/code/dawn
-git fetch origin <commit-hash>
-git show <commit-hash>:src/dawn/dawn.json | python3 -c "import json,sys; print(json.dumps(json.load(sys.stdin)['<struct-name>'], indent=2))"
+git fetch origin 75beadd1f3ab1c541ae743ef943480f434983a4e
+# Check a struct layout
+git show 75beadd1f3:src/dawn/dawn.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d['texel copy texture info'], indent=2))"
+# Check enum values
+git show 75beadd1f3:src/dawn/dawn.json | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d['texture usage'], indent=2))"
 ```
 
 **The `dawn.json` file is the source of truth for the Dawn C API.** It defines all struct layouts, enum values, and function signatures. The C header (`webgpu.h`) is generated from it.

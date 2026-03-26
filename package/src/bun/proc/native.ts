@@ -439,7 +439,7 @@ export const native = (() => {
 				returns: FFIType.void,
 			},
 			wgpuCreateAdapterDeviceMainThread: {
-				args: [FFIType.ptr, FFIType.ptr, FFIType.ptr],
+				args: [FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.ptr, FFIType.u32, FFIType.ptr],
 				returns: FFIType.void,
 			},
 			wgpuCreateSurfaceForView: {
@@ -1719,11 +1719,17 @@ export const WGPUBridge = {
 		instancePtr: Pointer,
 		surfacePtr: Pointer,
 		outAdapterDevicePtr: Pointer,
+		requiredFeaturesPtr?: Pointer | number,
+		requiredFeatureCount?: number,
+		requiredLimitsPtr?: Pointer | number,
 	) =>
 		native.symbols.wgpuCreateAdapterDeviceMainThread(
 			instancePtr as any,
 			surfacePtr as any,
 			outAdapterDevicePtr as any,
+			(requiredFeaturesPtr ?? 0) as any,
+			requiredFeatureCount ?? 0,
+			(requiredLimitsPtr ?? 0) as any,
 		),
 	createSurfaceForView: (instancePtr: Pointer, viewPtr: Pointer): Pointer | null => {
 		if (!native?.symbols?.wgpuCreateSurfaceForView) return null;

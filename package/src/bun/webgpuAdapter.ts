@@ -2408,12 +2408,14 @@ class GPUCommandEncoder {
 		let tsWritesPtr: number | null = null;
 		if (descriptor.timestampWrites) {
 			const tw = descriptor.timestampWrites;
-			// WGPURenderPassTimestampWrites: querySet(8) + beginIndex(4) + endIndex(4) = 16
-			const twBuf = new ArrayBuffer(16);
+			// WGPURenderPassTimestampWrites (extensible: "in"):
+			//   nextInChain(ptr,8) + querySet(ptr,8) + beginIndex(u32,4) + endIndex(u32,4) = 24
+			const twBuf = new ArrayBuffer(24);
 			const twView = new DataView(twBuf);
-			writePtr(twView, 0, tw.querySet.ptr);
-			writeU32(twView, 8, tw.beginningOfPassWriteIndex ?? 0xffffffff);
-			writeU32(twView, 12, tw.endOfPassWriteIndex ?? 0xffffffff);
+			writePtr(twView, 0, 0); // nextInChain = null
+			writePtr(twView, 8, tw.querySet.ptr);
+			writeU32(twView, 16, tw.beginningOfPassWriteIndex ?? 0xffffffff);
+			writeU32(twView, 20, tw.endOfPassWriteIndex ?? 0xffffffff);
 			WGPU_KEEPALIVE.push(twBuf);
 			tsWritesPtr = ptr(twBuf) as any;
 		}
@@ -2441,11 +2443,14 @@ class GPUCommandEncoder {
 		let tsWritesPtr: number | null = null;
 		if (descriptor?.timestampWrites) {
 			const tw = descriptor.timestampWrites;
-			const twBuf = new ArrayBuffer(16);
+			// WGPURenderPassTimestampWrites (extensible: "in"):
+			//   nextInChain(ptr,8) + querySet(ptr,8) + beginIndex(u32,4) + endIndex(u32,4) = 24
+			const twBuf = new ArrayBuffer(24);
 			const twView = new DataView(twBuf);
-			writePtr(twView, 0, tw.querySet.ptr);
-			writeU32(twView, 8, tw.beginningOfPassWriteIndex ?? 0xffffffff);
-			writeU32(twView, 12, tw.endOfPassWriteIndex ?? 0xffffffff);
+			writePtr(twView, 0, 0); // nextInChain = null
+			writePtr(twView, 8, tw.querySet.ptr);
+			writeU32(twView, 16, tw.beginningOfPassWriteIndex ?? 0xffffffff);
+			writeU32(twView, 20, tw.endOfPassWriteIndex ?? 0xffffffff);
 			WGPU_KEEPALIVE.push(twBuf);
 			tsWritesPtr = ptr(twBuf) as any;
 		}
@@ -2767,25 +2772,25 @@ class GPUComputePassEncoder {
 }
 
 // WGPUFeatureName enum → WebGPU feature string mapping
+// Values from dawn.json commit 75beadd1f3 (src/dawn/dawn.json "feature name")
 const WGPU_FEATURE_MAP: [number, string][] = [
-	[0x00000001, "depth-clip-control"],
-	[0x00000002, "depth32float-stencil8"],
-	[0x00000003, "timestamp-query"],
-	[0x00000004, "texture-compression-bc"],
-	[0x00000005, "texture-compression-bc-sliced-3d"],
-	[0x00000006, "texture-compression-etc2"],
-	[0x00000007, "texture-compression-astc"],
-	[0x00000008, "texture-compression-astc-sliced-3d"],
-	[0x00000009, "indirect-first-instance"],
-	[0x0000000a, "shader-f16"],
-	[0x0000000b, "rg11b10ufloat-renderable"],
-	[0x0000000c, "bgra8unorm-storage"],
-	[0x0000000d, "float32-filterable"],
-	[0x0000000e, "float32-blendable"],
-	[0x0000000f, "subgroups"],
-	[0x00000010, "subgroups-f16"],
-	[0x00000011, "dual-source-blending"],
-	[0x00000012, "clip-distances"],
+	[2, "depth-clip-control"],
+	[3, "depth32float-stencil8"],
+	[4, "texture-compression-bc"],
+	[5, "texture-compression-bc-sliced-3d"],
+	[6, "texture-compression-etc2"],
+	[7, "texture-compression-astc"],
+	[8, "texture-compression-astc-sliced-3d"],
+	[9, "timestamp-query"],
+	[10, "indirect-first-instance"],
+	[11, "shader-f16"],
+	[12, "rg11b10ufloat-renderable"],
+	[13, "bgra8unorm-storage"],
+	[14, "float32-filterable"],
+	[15, "float32-blendable"],
+	[16, "clip-distances"],
+	[17, "dual-source-blending"],
+	[18, "subgroups"],
 ];
 
 // WGPULimits field layout: offset from start of WGPULimits struct, name, type
@@ -2876,12 +2881,46 @@ class GPUAdapter {
 	}
 	async requestDevice(descriptor?: {
 		requiredFeatures?: string[];
+		requiredLimits?: Record<string, number>;
 	}) {
+		// Build reverse map: feature name → Dawn enum value
+		const featureNameToEnum = new Map<string, number>();
+		for (const [enumVal, name] of WGPU_FEATURE_MAP) {
+			featureNameToEnum.set(name, enumVal);
+		}
+
+		// Build features array for FFI
+		let featuresPtr: ReturnType<typeof ptr> | number = 0;
+		let featuresCount = 0;
+		let featuresArray: Uint32Array | null = null;
+
+		if (descriptor?.requiredFeatures?.length) {
+			const values: number[] = [];
+			for (const name of descriptor.requiredFeatures) {
+				const enumVal = featureNameToEnum.get(name);
+				if (enumVal !== undefined) {
+					values.push(enumVal);
+				}
+			}
+			if (values.length > 0) {
+				featuresArray = new Uint32Array(values);
+				featuresPtr = ptr(featuresArray);
+				featuresCount = values.length;
+				WGPU_KEEPALIVE.push(featuresArray);
+			}
+		}
+
+		// TODO: build WGPULimits struct from descriptor?.requiredLimits if provided
+		const limitsPtr = 0;
+
 		const adapterDevice = new BigUint64Array(2);
 		WGPUBridge.createAdapterDeviceMainThread(
 			this.instancePtr as any,
 			this.surfacePtr as any,
 			ptr(adapterDevice),
+			featuresPtr as any,
+			featuresCount,
+			limitsPtr as any,
 		);
 		this.adapterPtr = Number(adapterDevice[0]);
 		const devicePtr = adapterDevice[1];
@@ -2893,10 +2932,17 @@ class GPUAdapter {
 		this._populateLimits();
 
 		const device = new GPUDevice(Number(devicePtr), this.instancePtr);
-		// Copy supported features to device (device gets all adapter features
-		// since we can't pass requiredFeatures through the C++ path yet)
-		for (const f of this.features) {
-			device.features.add(f);
+		// Set device features: only requested features if specified, else all adapter features
+		if (descriptor?.requiredFeatures?.length) {
+			for (const f of descriptor.requiredFeatures) {
+				if (this.features.has(f)) {
+					device.features.add(f);
+				}
+			}
+		} else {
+			for (const f of this.features) {
+				device.features.add(f);
+			}
 		}
 		Object.assign(device.limits, this.limits);
 		return device;
