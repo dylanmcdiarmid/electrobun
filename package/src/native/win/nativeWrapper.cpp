@@ -4122,11 +4122,11 @@ public:
             if (x + width > cr.right) width = cr.right - x;
             if (y + height > cr.bottom) height = cr.bottom - y;
 
-            char dbg[512];
-            sprintf_s(dbg, "[WGPU] css=(%ld,%ld,%ld,%ld) phys=(%d,%d,%d,%d) container=(%ld,%ld) dpi=%.2f",
-                frame.left, frame.top, frame.right-frame.left, frame.bottom-frame.top,
-                x, y, width, height, cr.right, cr.bottom, dpiScale);
-            ::log(dbg);
+            // char dbg[512];
+            // sprintf_s(dbg, "[WGPU] css=(%ld,%ld,%ld,%ld) phys=(%d,%d,%d,%d) container=(%ld,%ld) dpi=%.2f",
+            //     frame.left, frame.top, frame.right-frame.left, frame.bottom-frame.top,
+            //     x, y, width, height, cr.right, cr.bottom, dpiScale);
+            // ::log(dbg);
 
             SetWindowPos(hwnd, HWND_TOP, x, y, width, height,
                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -4670,6 +4670,36 @@ public:
         // view->toggleMirrorMode(true);
     }
     
+    // Focus the CEF browser inside this container via CefBrowserHost::SetFocus.
+    // Used when the parent window is activated via alt-tab (WA_ACTIVE) to restore
+    // keyboard input to the CEF browser widget.
+    // Deferred to the CEF UI thread via CefPostTask to avoid timing races.
+    void FocusCefBrowser() {
+        for (auto& view : m_abstractViews) {
+            auto cefView = dynamic_cast<CEFView*>(view.get());
+            if (cefView && cefView->getBrowser()) {
+                CefRefPtr<CefBrowser> browser = cefView->getBrowser();
+
+                // Defer SetFocus to the CEF UI thread to avoid a timing race:
+                // WM_ACTIVATE fires on the Win32 message loop, but CEF needs to
+                // finish its own activation processing before it will accept focus.
+                class SetFocusTask : public CefTask {
+                public:
+                    CefRefPtr<CefBrowser> browser_;
+                    SetFocusTask(CefRefPtr<CefBrowser> b) : browser_(b) {}
+                    void Execute() override {
+                        if (browser_ && browser_->GetHost()) {
+                            browser_->GetHost()->SetFocus(true);
+                        }
+                    }
+                    IMPLEMENT_REFCOUNTING(SetFocusTask);
+                };
+                CefPostTask(TID_UI, new SetFocusTask(browser));
+                return;
+            }
+        }
+    }
+
     void RemoveAbstractViewWithId(uint32_t webviewId) {
         m_abstractViews.erase(
             std::remove_if(m_abstractViews.begin(), m_abstractViews.end(),
@@ -5050,6 +5080,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else {
                 if (data && data->focusHandler) {
                     data->focusHandler(data->windowId);
+                }
+                // When activating via alt-tab (WA_ACTIVE, not WA_CLICKACTIVE),
+                // CEF's browser child HWND doesn't automatically get keyboard focus.
+                // Find and focus the first visible child window (the CEF browser widget).
+                // When the window is activated, restore keyboard focus to the
+                // CEF browser widget via CefBrowserHost::SetFocus on the UI thread.
+                if (LOWORD(wParam) != WA_INACTIVE) {
+                    auto containerIt = g_containerViews.find(hwnd);
+                    if (containerIt != g_containerViews.end()) {
+                        containerIt->second->FocusCefBrowser();
+                    }
                 }
             }
             break;
