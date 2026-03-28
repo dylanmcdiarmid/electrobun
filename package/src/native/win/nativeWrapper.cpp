@@ -5974,6 +5974,34 @@ ELECTROBUN_EXPORT bool initCEF() {
         g_userChromiumFlags = electrobun::parseChromiumFlags(buildJsonContent);
     }
 
+    // When Dawn (WebGPU) is bundled, it owns the GPU exclusively. CEF's GPU process
+    // will crash repeatedly trying to initialize, then fall back to software rendering.
+    // Detect the Dawn DLL and proactively configure CEF for software-only rendering:
+    //   1. Add --disable-gpu to prevent CEF from spawning a GPU process
+    //   2. Skip the default --disable-features=VizDisplayCompositor so the Viz compositor
+    //      can handle software compositing (the legacy compositor needs GPU, causing white screen)
+    {
+        std::string dawnDllPath = std::string(exePath) + "\\webgpu_dawn.dll";
+        DWORD attrs = GetFileAttributesA(dawnDllPath.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES) {
+            std::cout << "[CEF] Dawn (WebGPU) detected — configuring CEF for software rendering" << std::endl;
+
+            // Only inject if the user hasn't already set --disable-gpu themselves
+            bool userSetDisableGpu = g_userChromiumFlags.skip.count("disable-gpu") > 0;
+            if (!userSetDisableGpu) {
+                electrobun::ChromiumFlag gpuFlag;
+                gpuFlag.name = "disable-gpu";
+                gpuFlag.hasValue = false;
+                g_userChromiumFlags.flags.push_back(gpuFlag);
+                // Also mark it in skip so it overrides any default
+                g_userChromiumFlags.skip.insert("disable-gpu");
+            }
+
+            // Ensure VizDisplayCompositor is NOT disabled (it handles software compositing)
+            g_userChromiumFlags.skip.insert("disable-features=VizDisplayCompositor");
+        }
+    }
+
     // CEF settings
     CefSettings settings;
     settings.no_sandbox = true;
@@ -6828,9 +6856,12 @@ CefRefPtr<CefRequestContext> CreateRequestContextForPartition(const char* partit
                 clog("ERROR CEF: LOCALAPPDATA not found, falling back to in-memory session\n");
                 settings.persist_session_cookies = false;
             } else {
-                // Build path with identifier/channel structure (consistent with CLI and updater)
-                // Structure: %LOCALAPPDATA%\{identifier}\{channel}\CEF\Partitions\{partitionName}
-                std::string cachePath = buildPartitionPath(localAppData, g_electrobunIdentifier, g_electrobunChannel, "CEF", partitionName, '\\');
+                // Place partition profiles directly under root_cache_path as "Partition_{name}"
+                // so Chrome recognizes them as valid profile directories. Using nested paths
+                // like root/Partitions/name causes "Cannot create profile" errors because
+                // Chrome's profile system doesn't allow profiles nested under other profiles.
+                std::string cachePath = buildAppDataPath(localAppData, g_electrobunIdentifier, g_electrobunChannel, "CEF", '\\');
+                cachePath += "\\Partition_" + partitionName;
 
                 // Create directory if it doesn't exist
                 std::wstring wideCachePath(cachePath.begin(), cachePath.end());
